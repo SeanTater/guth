@@ -89,6 +89,14 @@ This is a pure Python package with Rust extensions in `training/rust_exts/audio_
 
 ## Development Workflow
 
+### Project Style (Current Rust Rewrite)
+
+- **TDD first**: add or extend tests/fixtures before implementation changes when possible.
+- **Parity fixtures**: generate one-off fixtures with Python (via `uv run --with ...`); never run Python during Rust tests.
+- **Audits**: keep plan/audit notes up to date as work proceeds.
+- **Plans not checked in**: `.plans/` is ignored; update locally but don’t commit unless explicitly asked.
+- **Commit/push cadence**: commit and push at each meaningful step (tests first, then implementation).
+
 ### Key Patterns
 
 1. **Streaming Generation**: The model generates audio frame-by-frame (12.5 Hz frame rate, 80ms per frame). All modules inherit from `StatefulModule` to maintain internal state.
