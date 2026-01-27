@@ -82,6 +82,7 @@ profile_output*
 *.safetensors
 *.wav
 *.model
+!guth/tests/fixtures/*.model
 *.pt
 
 # Agents files, use a symlink to AGENTS.md instead. 

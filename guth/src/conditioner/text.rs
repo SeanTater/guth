@@ -131,6 +131,44 @@ impl TextTokenizer {
 #[cfg(test)]
 mod tests {
     use super::TextTokenizer;
+    use serde::Deserialize;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[derive(Debug, Deserialize)]
+    struct TokenizerFixture {
+        model_file: String,
+        cases: Vec<TokenizerCase>,
+        split_cases: Vec<SplitCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct TokenizerCase {
+        text: String,
+        prepared: String,
+        frames_after_eos: usize,
+        encoded: Vec<u32>,
+        decoded: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SplitCase {
+        text: String,
+        max_tokens: usize,
+        chunks: Vec<String>,
+    }
+
+    fn fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    fn load_fixture() -> TokenizerFixture {
+        let data = fs::read_to_string(fixture_path("tokenizer_fixture.json")).expect("fixture read");
+        serde_json::from_str(&data).expect("fixture parse")
+    }
 
     #[test]
     fn prepare_text_prompt_basic() {
@@ -139,5 +177,32 @@ mod tests {
         assert!(text.starts_with("        Hello"));
         assert!(text.ends_with('.'));
         assert_eq!(frames, 3);
+    }
+
+    #[test]
+    fn tokenizer_matches_fixture() {
+        let fixture = load_fixture();
+        let model_path = fixture_path(&fixture.model_file);
+        let tokenizer = TextTokenizer::open(model_path).expect("open tokenizer");
+
+        for case in fixture.cases {
+            let (prepared, frames) =
+                TextTokenizer::prepare_text_prompt(&case.text).expect("prepare");
+            assert_eq!(prepared, case.prepared);
+            assert_eq!(frames, case.frames_after_eos);
+
+            let encoded = tokenizer.encode(&prepared).expect("encode");
+            assert_eq!(encoded, case.encoded);
+
+            let decoded = tokenizer.decode(&encoded).expect("decode");
+            assert_eq!(decoded, case.decoded);
+        }
+
+        for case in fixture.split_cases {
+            let chunks = tokenizer
+                .split_into_best_sentences(&case.text, case.max_tokens)
+                .expect("split");
+            assert_eq!(chunks, case.chunks);
+        }
     }
 }

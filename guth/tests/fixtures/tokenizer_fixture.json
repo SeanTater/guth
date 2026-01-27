@@ -1,0 +1,107 @@
+{
+  "model_file": "tokenizer.model",
+  "cases": [
+    {
+      "text": "hello world",
+      "prepared": "        Hello world.",
+      "frames_after_eos": 3,
+      "encoded": [
+        2,
+        37,
+        10,
+        7,
+        7,
+        6,
+        19,
+        17,
+        7,
+        16,
+        4
+      ],
+      "decoded": "Hello world."
+    },
+    {
+      "text": "short sentence",
+      "prepared": "        Short sentence.",
+      "frames_after_eos": 3,
+      "encoded": [
+        2,
+        29,
+        13,
+        17,
+        5,
+        11,
+        4
+      ],
+      "decoded": "Short sentence."
+    },
+    {
+      "text": "numbers 123 and symbols",
+      "prepared": "        Numbers 123 and symbols.",
+      "frames_after_eos": 3,
+      "encoded": [
+        2,
+        38,
+        8,
+        15,
+        10,
+        46,
+        3,
+        2,
+        32,
+        33,
+        34,
+        22,
+        14,
+        16,
+        26,
+        41,
+        15,
+        6,
+        7,
+        3,
+        4
+      ],
+      "decoded": "Numbers 123 and symbols."
+    },
+    {
+      "text": "questions? yes",
+      "prepared": "        Questions? yes.",
+      "frames_after_eos": 3,
+      "encoded": [
+        2,
+        28,
+        8,
+        24,
+        20,
+        3,
+        35,
+        2,
+        41,
+        24,
+        4
+      ],
+      "decoded": "Questions? yes."
+    }
+  ],
+  "split_cases": [
+    {
+      "text": "hello world. short sentence. another test sentence with punctuation!",
+      "max_tokens": 12,
+      "chunks": [
+        "Hello world.",
+        "short sentence.",
+        "another test sentence with punctuation!"
+      ]
+    },
+    {
+      "text": "questions? yes. numbers 123 and symbols.",
+      "max_tokens": 8,
+      "chunks": [
+        "Questions?",
+        "yes.",
+        "numbers 123 and symbols."
+      ]
+    }
+  ]
+}
