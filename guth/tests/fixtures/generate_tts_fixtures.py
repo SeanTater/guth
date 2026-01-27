@@ -4,6 +4,7 @@ import pathlib
 from typing import Any, Iterable
 
 import torch
+import safetensors.torch
 
 from pocket_tts.conditioners.base import TokenizedText
 from pocket_tts.conditioners.text import LUTConditioner
@@ -128,6 +129,44 @@ def serialize_transformer(transformer):
             }
         )
     return {"layers": layers}
+
+
+def add_seanet_weights(state: dict[str, torch.Tensor], prefix: str, model: torch.nn.Module):
+    for idx, layer in enumerate(model.model):
+        if isinstance(layer, StreamingConv1d):
+            state[f"{prefix}.layers.{idx}.conv.weight"] = layer.conv.weight
+            state[f"{prefix}.layers.{idx}.conv.bias"] = layer.conv.bias
+        elif isinstance(layer, StreamingConvTranspose1d):
+            state[f"{prefix}.layers.{idx}.conv_transpose.weight"] = layer.convtr.weight
+            state[f"{prefix}.layers.{idx}.conv_transpose.bias"] = layer.convtr.bias
+        elif isinstance(layer, SEANetResnetBlock):
+            convs = [block for block in layer.block if isinstance(block, StreamingConv1d)]
+            for conv_idx, conv in enumerate(convs):
+                state[f"{prefix}.layers.{idx}.resblock.{conv_idx}.weight"] = conv.conv.weight
+                state[f"{prefix}.layers.{idx}.resblock.{conv_idx}.bias"] = conv.conv.bias
+
+
+def add_projected_transformer_state(
+    state: dict[str, torch.Tensor], prefix: str, transformer: ProjectedTransformer
+):
+    if transformer.input_proj is not None:
+        state[f"{prefix}.input_proj.weight"] = transformer.input_proj.weight
+    for idx, proj in enumerate(transformer.output_projs):
+        if isinstance(proj, torch.nn.Identity):
+            continue
+        state[f"{prefix}.output_projs.{idx}.weight"] = proj.weight
+    for idx, layer in enumerate(transformer.transformer.layers):
+        state[f"{prefix}.layers.{idx}.self_attn.in_proj.weight"] = layer.self_attn.in_proj.weight
+        state[f"{prefix}.layers.{idx}.self_attn.out_proj.weight"] = layer.self_attn.out_proj.weight
+        state[f"{prefix}.layers.{idx}.norm1.weight"] = layer.norm1.weight
+        state[f"{prefix}.layers.{idx}.norm1.bias"] = layer.norm1.bias
+        state[f"{prefix}.layers.{idx}.norm2.weight"] = layer.norm2.weight
+        state[f"{prefix}.layers.{idx}.norm2.bias"] = layer.norm2.bias
+        state[f"{prefix}.layers.{idx}.linear1.weight"] = layer.linear1.weight
+        state[f"{prefix}.layers.{idx}.linear2.weight"] = layer.linear2.weight
+        if hasattr(layer, "layer_scale_1"):
+            state[f"{prefix}.layers.{idx}.layer_scale_1.scale"] = layer.layer_scale_1.scale
+            state[f"{prefix}.layers.{idx}.layer_scale_2.scale"] = layer.layer_scale_2.scale
 
 
 def load_fixture(name: str):
@@ -296,6 +335,8 @@ def main() -> None:
     # Regenerate with: uv run --with torch guth/tests/fixtures/generate_tts_fixtures.py
     torch.manual_seed(31)
 
+    mimi_fixture = load_fixture("mimi_model.json")
+
     ldim = 4
     dim = 4
 
@@ -444,25 +485,12 @@ def main() -> None:
                 "frequency_embedding_size": 8,
                 "max_period": 10.0,
             },
-            "weights": serialize_flow_net(flow_lm.flow_net),
         },
         "conditioner": {
             "n_bins": n_bins,
-            "embed_weight": to_list(flow_lm.conditioner.embed.weight),
             "text": text,
             "tokens": to_list(tokens),
         },
-        "input_linear_weight": to_list(flow_lm.input_linear.weight),
-        "bos_emb": to_list(flow_lm.bos_emb),
-        "emb_mean": to_list(flow_lm.emb_mean),
-        "emb_std": to_list(flow_lm.emb_std),
-        "speaker_proj_weight": to_list(speaker_proj_weight),
-        "transformer": serialize_transformer(flow_lm.transformer),
-        "out_norm": {
-            "gamma": to_list(flow_lm.out_norm.weight),
-            "beta": to_list(flow_lm.out_norm.bias),
-        },
-        "out_eos": {"weight": to_list(flow_lm.out_eos.weight), "bias": to_list(flow_lm.out_eos.bias)},
         "generation": {
             "max_gen_len": max_gen_len,
             "frames_after_eos": frames_after_eos,
@@ -471,15 +499,27 @@ def main() -> None:
             "noise_clamp": noise_clamp,
             "eos_threshold": eos_threshold,
         },
+        "mimi_config": mimi_fixture["config"],
         "latents": to_list(torch.cat(latents, dim=1)),
         "eos": to_list(torch.cat(eos_flags, dim=1)),
-        "audio_chunks": to_list(torch.cat(audio_chunks, dim=2)),
         "audio_full": to_list(audio_full),
-        "quantizer_weight": to_list(quantizer_weight),
     }
 
     with (FIXTURES / "tts_model.json").open("w", encoding="utf-8") as f:
         json.dump(fixture, f, indent=2)
+
+    flow_state = {key: value.contiguous() for key, value in flow_lm.state_dict().items()}
+    flow_state["speaker_proj_weight"] = speaker_proj_weight
+    safetensors.torch.save_file(flow_state, FIXTURES / "tts_flow_lm_state.safetensors")
+
+    mimi_state = {}
+    add_seanet_weights(mimi_state, "encoder", mimi.encoder)
+    add_seanet_weights(mimi_state, "decoder", mimi.decoder)
+    add_projected_transformer_state(mimi_state, "encoder_transformer", mimi.encoder_transformer)
+    add_projected_transformer_state(mimi_state, "decoder_transformer", mimi.decoder_transformer)
+    mimi_state["quantizer.weight"] = mimi.quantizer.output_proj.weight
+    mimi_state = {key: value.contiguous() for key, value in mimi_state.items()}
+    safetensors.torch.save_file(mimi_state, FIXTURES / "tts_mimi_state.safetensors")
 
 
 if __name__ == "__main__":
