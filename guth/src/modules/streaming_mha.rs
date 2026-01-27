@@ -2,7 +2,7 @@ use crate::state::{StreamStep, StreamingModule};
 use burn::tensor::backend::Backend;
 use burn::tensor::module::attention;
 use burn::tensor::{Bool, Int, Tensor};
-use burn_nn::{RotaryEncoding, RotaryEncodingConfig};
+use std::marker::PhantomData;
 
 #[derive(Debug, Default)]
 pub struct StreamingMha;
@@ -54,17 +54,16 @@ impl Default for StreamingMhaConfig {
 #[derive(Debug, Clone)]
 pub struct StreamingMhaOp<B: Backend> {
     pub config: StreamingMhaConfig,
-    pub rope: Option<RotaryEncoding<B>>,
+    _backend: PhantomData<B>,
 }
 
 impl<B: Backend> StreamingMhaOp<B> {
     pub fn new(config: StreamingMhaConfig, device: &B::Device) -> Self {
-        let rope = config.rope_max_seq.map(|max_seq| {
-            RotaryEncodingConfig::new(max_seq, config.head_dim)
-                .with_theta(config.rope_theta)
-                .init::<B>(device)
-        });
-        Self { config, rope }
+        let _ = device;
+        Self {
+            config,
+            _backend: PhantomData,
+        }
     }
 
     pub fn append_kv(&self, state: &mut StreamingMhaState<B>, keys: Tensor<B, 4>, values: Tensor<B, 4>) {
@@ -94,10 +93,44 @@ impl<B: Backend> StreamingMhaOp<B> {
     }
 
     pub fn apply_rope(&self, tensor: Tensor<B, 4>, start: usize) -> Tensor<B, 4> {
-        match &self.rope {
-            Some(rope) => rope.apply(tensor, start),
-            None => tensor,
+        if self.config.rope_max_seq.is_none() {
+            return tensor;
         }
+        let [batch, heads, seq, dim] = tensor.dims();
+        let half = dim / 2;
+        let device = tensor.device();
+
+        let scale = -self.config.rope_theta.ln() * 2.0 / dim as f32;
+        let ds = Tensor::<B, 1, Int>::arange(0..half as i64, &device).float();
+        let freqs = ds.mul_scalar(scale).exp();
+
+        let ts = Tensor::<B, 1, Int>::arange(0..seq as i64, &device)
+            .float()
+            .add_scalar(start as f32);
+        let angles = ts.unsqueeze_dim::<2>(1).mul(freqs.unsqueeze_dim::<2>(0));
+        let rotr = angles.clone().cos();
+        let roti = angles.sin();
+
+        let rotr = rotr.unsqueeze_dim::<3>(0).unsqueeze_dim::<4>(2).repeat_dim(0, batch).repeat_dim(2, heads);
+        let roti = roti.unsqueeze_dim::<3>(0).unsqueeze_dim::<4>(2).repeat_dim(0, batch).repeat_dim(2, heads);
+
+        let reshaped = tensor
+            .swap_dims(1, 2)
+            .reshape([batch, seq, heads, half, 2]);
+        let real = reshaped.clone().narrow(4, 0, 1).reshape([batch, seq, heads, half]);
+        let imag = reshaped.clone().narrow(4, 1, 1).reshape([batch, seq, heads, half]);
+
+        let rot_real = real.clone().mul(rotr.clone()).sub(imag.clone().mul(roti.clone()));
+        let rot_imag = real.mul(roti).add(imag.mul(rotr));
+
+        let rotated = Tensor::cat(
+            vec![rot_real.unsqueeze_dim::<5>(4), rot_imag.unsqueeze_dim::<5>(4)],
+            4,
+        )
+        .reshape([batch, seq, heads, dim])
+        .swap_dims(1, 2);
+
+        rotated
     }
 
     pub fn attention(&self, state: &StreamingMhaState<B>, queries: Tensor<B, 4>) -> Tensor<B, 4> {

@@ -1,4 +1,7 @@
 use anyhow::Result;
+use burn::tensor::backend::Backend;
+use burn::tensor::{Int, Tensor};
+use burn_nn::{Embedding, EmbeddingConfig};
 use sentencepiece::SentencePieceProcessor;
 
 #[derive(Debug)]
@@ -125,6 +128,37 @@ impl TextTokenizer {
         }
 
         Ok(chunks)
+    }
+}
+
+#[derive(Debug)]
+pub struct LutConditioner<B: Backend> {
+    pub tokenizer: Option<TextTokenizer>,
+    pub embed: Embedding<B>,
+    pub dim: usize,
+    pub output_dim: usize,
+}
+
+impl<B: Backend> LutConditioner<B> {
+    pub fn new(
+        n_bins: usize,
+        tokenizer_path: impl AsRef<std::path::Path>,
+        dim: usize,
+        output_dim: usize,
+        device: &B::Device,
+    ) -> Result<Self> {
+        let tokenizer = Some(TextTokenizer::open(tokenizer_path)?);
+        let embed = EmbeddingConfig::new(n_bins + 1, dim).init::<B>(device);
+        Ok(Self {
+            tokenizer,
+            embed,
+            dim,
+            output_dim,
+        })
+    }
+
+    pub fn forward_tokens(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+        self.embed.forward(tokens)
     }
 }
 

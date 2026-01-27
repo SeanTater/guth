@@ -35,17 +35,17 @@ impl Default for StreamingTransformerLayerConfig {
 
 #[derive(Debug, Clone)]
 pub struct StreamingTransformerLayer<B: Backend> {
-    num_heads: usize,
-    head_dim: usize,
-    qkv: Linear<B>,
-    out_proj: Linear<B>,
-    norm1: LayerNorm<B>,
-    norm2: LayerNorm<B>,
-    ffn_in: Linear<B>,
-    ffn_out: Linear<B>,
-    layer_scale_1: Option<LayerScale<B>>,
-    layer_scale_2: Option<LayerScale<B>>,
-    mha: StreamingMhaOp<B>,
+    pub num_heads: usize,
+    pub head_dim: usize,
+    pub qkv: Linear<B>,
+    pub out_proj: Linear<B>,
+    pub norm1: LayerNorm<B>,
+    pub norm2: LayerNorm<B>,
+    pub ffn_in: Linear<B>,
+    pub ffn_out: Linear<B>,
+    pub layer_scale_1: Option<LayerScale<B>>,
+    pub layer_scale_2: Option<LayerScale<B>>,
+    pub mha: StreamingMhaOp<B>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,12 +56,20 @@ pub struct StreamingTransformerLayerState<B: Backend> {
 impl<B: Backend> StreamingTransformerLayer<B> {
     pub fn new(config: StreamingTransformerLayerConfig, device: &B::Device) -> Self {
         let head_dim = config.d_model / config.num_heads;
-        let qkv = LinearConfig::new(config.d_model, config.d_model * 3).init::<B>(device);
-        let out_proj = LinearConfig::new(config.d_model, config.d_model).init::<B>(device);
+        let qkv = LinearConfig::new(config.d_model, config.d_model * 3)
+            .with_bias(false)
+            .init::<B>(device);
+        let out_proj = LinearConfig::new(config.d_model, config.d_model)
+            .with_bias(false)
+            .init::<B>(device);
         let norm1 = LayerNormConfig::new(config.d_model).init::<B>(device);
         let norm2 = LayerNormConfig::new(config.d_model).init::<B>(device);
-        let ffn_in = LinearConfig::new(config.d_model, config.ffn_dim).init::<B>(device);
-        let ffn_out = LinearConfig::new(config.ffn_dim, config.d_model).init::<B>(device);
+        let ffn_in = LinearConfig::new(config.d_model, config.ffn_dim)
+            .with_bias(false)
+            .init::<B>(device);
+        let ffn_out = LinearConfig::new(config.ffn_dim, config.d_model)
+            .with_bias(false)
+            .init::<B>(device);
 
         let layer_scale_1 = config
             .layer_scale

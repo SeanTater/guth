@@ -79,10 +79,10 @@ impl<B: Backend> RmsNorm<B> {
 
 #[derive(Debug, Clone)]
 pub struct TimestepEmbedder<B: Backend> {
-    freqs: Tensor<B, 1>,
-    proj_in: Linear<B>,
-    proj_out: Linear<B>,
-    norm: RmsNorm<B>,
+    pub freqs: Tensor<B, 1>,
+    pub proj_in: Linear<B>,
+    pub proj_out: Linear<B>,
+    pub norm: RmsNorm<B>,
 }
 
 impl<B: Backend> TimestepEmbedder<B> {
@@ -131,11 +131,11 @@ impl ResBlockConfig {
 
 #[derive(Debug, Clone)]
 pub struct ResBlock<B: Backend> {
-    channels: usize,
-    norm: LayerNorm<B>,
-    mlp_in: Linear<B>,
-    mlp_out: Linear<B>,
-    mod_linear: Linear<B>,
+    pub channels: usize,
+    pub norm: LayerNorm<B>,
+    pub mlp_in: Linear<B>,
+    pub mlp_out: Linear<B>,
+    pub mod_linear: Linear<B>,
 }
 
 impl<B: Backend> ResBlock<B> {
@@ -188,10 +188,10 @@ impl FinalLayerConfig {
 
 #[derive(Debug, Clone)]
 pub struct FinalLayer<B: Backend> {
-    model_channels: usize,
-    norm: LayerNorm<B>,
-    linear: Linear<B>,
-    mod_linear: Linear<B>,
+    pub model_channels: usize,
+    pub norm: LayerNorm<B>,
+    pub linear: Linear<B>,
+    pub mod_linear: Linear<B>,
 }
 
 impl<B: Backend> FinalLayer<B> {
@@ -246,12 +246,12 @@ impl SimpleMlpAdaLnConfig {
 
 #[derive(Debug, Clone)]
 pub struct SimpleMlpAdaLn<B: Backend> {
-    num_time_conds: usize,
-    time_embed: Vec<TimestepEmbedder<B>>,
-    cond_embed: Linear<B>,
-    input_proj: Linear<B>,
-    res_blocks: Vec<ResBlock<B>>,
-    final_layer: FinalLayer<B>,
+    pub num_time_conds: usize,
+    pub time_embed: Vec<TimestepEmbedder<B>>,
+    pub cond_embed: Linear<B>,
+    pub input_proj: Linear<B>,
+    pub res_blocks: Vec<ResBlock<B>>,
+    pub final_layer: FinalLayer<B>,
 }
 
 impl<B: Backend> SimpleMlpAdaLn<B> {

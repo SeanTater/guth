@@ -136,9 +136,20 @@ def main() -> None:
     sequence = torch.tensor(
         [[[float("nan"), 0.1, -0.2], [0.05, -0.1, 0.2]]], dtype=torch.float32
     )
+    sequence_nan_mask = torch.isnan(sequence)
+    sequence_clean = torch.nan_to_num(sequence, nan=0.0)
 
     sequence_length = sequence.shape[1] + text_embeddings.shape[1]
     model_state = init_states(model, batch_size=1, sequence_length=sequence_length)
+    transformer_state = init_states(model, batch_size=1, sequence_length=sequence_length)
+
+    sequence_with_bos = torch.where(torch.isnan(sequence), model.bos_emb, sequence)
+    input_linear = model.input_linear(sequence_with_bos)
+    transformer_input = torch.cat([text_embeddings, input_linear], dim=1)
+    transformer_raw = model.transformer(transformer_input, transformer_state)
+    transformer_normed = model.out_norm(transformer_raw)
+    transformer_trimmed = transformer_normed[:, -sequence.shape[1] :]
+    transformer_last = transformer_trimmed[:, -1]
 
     latent, eos = model(
         sequence=sequence,
@@ -192,7 +203,14 @@ def main() -> None:
         },
         "out_norm": {"gamma": to_list(model.out_norm.weight), "beta": to_list(model.out_norm.bias)},
         "out_eos": {"weight": to_list(model.out_eos.weight), "bias": to_list(model.out_eos.bias)},
-        "sequence": to_list(sequence),
+        "sequence": to_list(sequence_clean),
+        "sequence_nan_mask": to_list(sequence_nan_mask),
+        "input_linear": to_list(input_linear),
+        "transformer_input": to_list(transformer_input),
+        "transformer_raw": to_list(transformer_raw),
+        "transformer_normed": to_list(transformer_normed),
+        "transformer_trimmed": to_list(transformer_trimmed),
+        "transformer_last": to_list(transformer_last),
         "latent": to_list(latent),
         "eos": to_list(eos),
     }
