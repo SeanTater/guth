@@ -72,3 +72,6 @@ python-preference = "only-managed"
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"
+
+[tool.pytest.ini_options]
+norecursedirs = ["burn"]

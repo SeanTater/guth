@@ -56,6 +56,11 @@ def test_generate_with_custom_voice(tmp_path):
         ],
     )
 
+    if result.exit_code != 0 and result.exception:
+        message = str(result.exception)
+        if "voice cloning" in message and "accept the terms" in message:
+            pytest.skip("Voice cloning weights not available locally")
+
     assert result.exit_code == 0
     assert output_file.exists()
 
