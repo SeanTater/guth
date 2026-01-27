@@ -42,3 +42,16 @@ impl StreamingModule for StreamingConvTranspose1d {
         state.step.increment(increment);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{StreamingConv1d, StreamingModule};
+
+    #[test]
+    fn streaming_conv_state_increments() {
+        let module = StreamingConv1d::default();
+        let mut state = module.init_state(1, 0);
+        module.increment_step(&mut state, 3);
+        assert_eq!(state.step.index, 3);
+    }
+}
