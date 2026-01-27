@@ -1,4 +1,3 @@
-use burn::module::Param;
 use burn::tensor::{Tensor, TensorData};
 use burn_ndarray::{NdArray, NdArrayDevice};
 use serde::Deserialize;
@@ -6,18 +5,19 @@ use serde::Deserialize;
 use guth::model::mimi::MimiModel;
 use guth::modules::dummy_quantizer::DummyQuantizer;
 use guth::modules::mimi_transformer::{
-    MimiProjectedTransformer, MimiProjectedTransformerConfig, MimiTransformerConfig, ProjectedOutput,
+    MimiProjectedTransformer, MimiProjectedTransformerConfig, MimiTransformerConfig,
 };
 use guth::modules::seanet::{SeanetDecoder, SeanetEncoder, SeanetLayer, SeanetResnetBlock};
-use guth::modules::streaming_conv::{PaddingMode, StreamingConv1dOp, StreamingConvConfig, StreamingConvTranspose1dOp};
+use guth::modules::streaming_conv::{
+    PaddingMode, StreamingConv1dOp, StreamingConvConfig, StreamingConvTranspose1dOp,
+};
+use guth::weights::load_mimi_state_dict;
 
 const FIXTURE_DIR: &str = "tests/fixtures";
 type TestBackend = NdArray<f32>;
 
 #[derive(Deserialize)]
 struct DummyQuantizerFixture {
-    output_dimension: usize,
-    weight: Vec<Vec<Vec<f32>>>,
     input: Vec<Vec<Vec<f32>>>,
     output: Vec<Vec<Vec<f32>>>,
 }
@@ -25,8 +25,6 @@ struct DummyQuantizerFixture {
 #[derive(Deserialize)]
 struct MimiFixture {
     config: MimiConfigFixture,
-    encoder_transformer: ProjectedTransformerFixture,
-    decoder_transformer: ProjectedTransformerFixture,
     audio_input: Vec<Vec<Vec<f32>>>,
     latent_output: Vec<Vec<Vec<f32>>>,
     latent_input: Vec<Vec<Vec<f32>>>,
@@ -54,58 +52,6 @@ struct MimiTransformerFixtureConfig {
     context: usize,
     max_period: f32,
     dim_feedforward: usize,
-}
-
-#[derive(Deserialize)]
-struct ProjectedTransformerFixture {
-    input_proj: ProjectedInputFixture,
-    output_projs: Vec<ProjectedOutputFixture>,
-    layers: Vec<TransformerLayerFixture>,
-}
-
-#[derive(Deserialize)]
-struct ProjectedInputFixture {
-    kind: String,
-    weight: Option<Vec<Vec<f32>>>,
-}
-
-#[derive(Deserialize)]
-struct ProjectedOutputFixture {
-    kind: String,
-    weight: Option<Vec<Vec<f32>>>,
-}
-
-#[derive(Deserialize)]
-struct TransformerLayerFixture {
-    self_attn: SelfAttnFixture,
-    norm1: NormFixture,
-    norm2: NormFixture,
-    linear1: LinearFixture,
-    linear2: LinearFixture,
-    layer_scale_1: LayerScaleFixture,
-    layer_scale_2: LayerScaleFixture,
-}
-
-#[derive(Deserialize)]
-struct SelfAttnFixture {
-    in_proj: LinearFixture,
-    out_proj: LinearFixture,
-}
-
-#[derive(Deserialize)]
-struct LinearFixture {
-    weight: Vec<Vec<f32>>,
-}
-
-#[derive(Deserialize)]
-struct NormFixture {
-    gamma: Vec<f32>,
-    beta: Vec<f32>,
-}
-
-#[derive(Deserialize)]
-struct LayerScaleFixture {
-    scale: Vec<f32>,
 }
 
 #[derive(Deserialize)]
@@ -156,12 +102,6 @@ fn read_fixture<T: for<'de> Deserialize<'de>>(name: &str) -> T {
     serde_json::from_str(&data).expect("fixture parse")
 }
 
-fn tensor1_from_vec(data: Vec<f32>, device: &NdArrayDevice) -> Tensor<TestBackend, 1> {
-    let len = data.len();
-    let td = TensorData::new(data, vec![len]);
-    Tensor::from_data(td, device)
-}
-
 fn tensor3_from_nested(data: Vec<Vec<Vec<f32>>>, device: &NdArrayDevice) -> Tensor<TestBackend, 3> {
     let b = data.len();
     let c = data[0].len();
@@ -202,8 +142,11 @@ fn build_conv(config: &ConvConfigFixture, weight: Vec<Vec<Vec<f32>>>, bias: Vec<
         pad_mode,
         groups: 1,
     };
-    let weight = tensor3_from_nested(weight, device);
-    let bias = tensor1_from_vec(bias, device);
+    let out_channels = weight.len();
+    let in_channels = weight[0].len();
+    let kernel = weight[0][0].len();
+    let weight = Tensor::<TestBackend, 3>::zeros([out_channels, in_channels, kernel], device);
+    let bias = Tensor::<TestBackend, 1>::zeros([bias.len()], device);
     StreamingConv1dOp::new(conv_config, weight, Some(bias))
 }
 
@@ -221,8 +164,11 @@ fn build_conv_transpose(
         pad_mode: PaddingMode::Constant,
         groups: 1,
     };
-    let weight = tensor3_from_nested(weight, device);
-    let bias = tensor1_from_vec(bias, device);
+    let out_channels = weight.len();
+    let in_channels = weight[0].len();
+    let kernel = weight[0][0].len();
+    let weight = Tensor::<TestBackend, 3>::zeros([out_channels, in_channels, kernel], device);
+    let bias = Tensor::<TestBackend, 1>::zeros([bias.len()], device);
     StreamingConvTranspose1dOp::new(conv_config, weight, Some(bias))
 }
 
@@ -277,37 +223,7 @@ fn build_seanet_decoder(device: &NdArrayDevice) -> SeanetDecoder<TestBackend> {
     SeanetDecoder::new(layers)
 }
 
-fn apply_linear(linear: &mut burn_nn::Linear<TestBackend>, weight: Vec<Vec<f32>>, device: &NdArrayDevice) {
-    let out_dim = weight.len();
-    let in_dim = weight[0].len();
-    let mut flat = Vec::with_capacity(in_dim * out_dim);
-    for c in 0..in_dim {
-        for r in 0..out_dim {
-            flat.push(weight[r][c]);
-        }
-    }
-    let weight = Tensor::from_data(TensorData::new(flat, [in_dim, out_dim]), device);
-    linear.weight = Param::from_tensor(weight);
-}
-
-fn apply_layer_norm(norm: &mut burn_nn::LayerNorm<TestBackend>, weights: &NormFixture, device: &NdArrayDevice) {
-    let gamma = tensor1_from_vec(weights.gamma.clone(), device);
-    let beta = tensor1_from_vec(weights.beta.clone(), device);
-    norm.gamma = Param::from_tensor(gamma);
-    norm.beta = Some(Param::from_tensor(beta));
-}
-
-fn apply_layer_scale(
-    scale: &mut guth::modules::layer_scale::LayerScale<TestBackend>,
-    weights: &LayerScaleFixture,
-    device: &NdArrayDevice,
-) {
-    let weight = tensor1_from_vec(weights.scale.clone(), device);
-    scale.scale = weight;
-}
-
 fn build_projected_transformer(
-    fixture: &ProjectedTransformerFixture,
     config: &MimiTransformerFixtureConfig,
     device: &NdArrayDevice,
 ) -> MimiProjectedTransformer<TestBackend> {
@@ -325,82 +241,18 @@ fn build_projected_transformer(
         output_dims: config.output_dimensions.clone(),
         transformer: transformer_config,
     };
-    let mut projected = MimiProjectedTransformer::new(projected_config, device);
-
-    if fixture.input_proj.kind == "linear" {
-        let weight = fixture
-            .input_proj
-            .weight
-            .clone()
-            .expect("input proj weight");
-        let input_proj = projected.input_proj.as_mut().expect("input proj");
-        apply_linear(input_proj, weight, device);
-    }
-
-    for (index, output) in fixture.output_projs.iter().enumerate() {
-        match (&output.kind[..], projected.output_projs.get_mut(index)) {
-            ("identity", Some(ProjectedOutput::Identity)) => {}
-            ("linear", Some(ProjectedOutput::Linear(linear))) => {
-                let weight = output.weight.clone().expect("output proj weight");
-                apply_linear(linear, weight, device);
-            }
-            _ => panic!("unexpected output proj"),
-        }
-    }
-
-    for (layer, fixture_layer) in projected
-        .transformer
-        .layers
-        .iter_mut()
-        .zip(fixture.layers.iter())
-    {
-        apply_linear(&mut layer.self_attn.in_proj, fixture_layer.self_attn.in_proj.weight.clone(), device);
-        apply_linear(&mut layer.self_attn.out_proj, fixture_layer.self_attn.out_proj.weight.clone(), device);
-        apply_layer_norm(&mut layer.norm1, &fixture_layer.norm1, device);
-        apply_layer_norm(&mut layer.norm2, &fixture_layer.norm2, device);
-        apply_linear(&mut layer.linear1, fixture_layer.linear1.weight.clone(), device);
-        apply_linear(&mut layer.linear2, fixture_layer.linear2.weight.clone(), device);
-        if let Some(scale) = layer.layer_scale_1.as_mut() {
-            apply_layer_scale(scale, &fixture_layer.layer_scale_1, device);
-        }
-        if let Some(scale) = layer.layer_scale_2.as_mut() {
-            apply_layer_scale(scale, &fixture_layer.layer_scale_2, device);
-        }
-    }
-
-    projected
+    MimiProjectedTransformer::new(projected_config, device)
 }
 
-#[test]
-fn dummy_quantizer_matches_fixture() {
-    let device = NdArrayDevice::default();
-    let fixture: DummyQuantizerFixture = read_fixture("dummy_quantizer.json");
-    assert_eq!(fixture.weight.len(), fixture.output_dimension);
-
-    let weight = tensor3_from_nested(fixture.weight, &device);
-    let quantizer = DummyQuantizer::new(weight);
-    let input = tensor3_from_nested(fixture.input, &device);
-    let output = quantizer.forward(input).to_data();
-    let expected = tensor3_from_nested(fixture.output, &device).to_data();
-    assert_close(&output, &expected, 1e-4);
-}
-
-#[test]
-fn mimi_encode_decode_matches_fixture() {
-    let device = NdArrayDevice::default();
-    let fixture: MimiFixture = read_fixture("mimi_model.json");
-
-    let encoder = build_seanet_encoder(&device);
-    let decoder = build_seanet_decoder(&device);
-    let encoder_transformer =
-        build_projected_transformer(&fixture.encoder_transformer, &fixture.config.transformer, &device);
-    let decoder_transformer =
-        build_projected_transformer(&fixture.decoder_transformer, &fixture.config.transformer, &device);
-
-    let quantizer_weight = Tensor::<TestBackend, 3>::zeros([1, 1, 1], &device);
+fn build_mimi(fixture: &MimiFixture, device: &NdArrayDevice) -> MimiModel<TestBackend> {
+    let encoder = build_seanet_encoder(device);
+    let decoder = build_seanet_decoder(device);
+    let encoder_transformer = build_projected_transformer(&fixture.config.transformer, device);
+    let decoder_transformer = build_projected_transformer(&fixture.config.transformer, device);
+    let quantizer_weight = Tensor::<TestBackend, 3>::zeros([1, 1, 1], device);
     let quantizer = DummyQuantizer::new(quantizer_weight);
 
-    let mimi = MimiModel::new(
+    let mut mimi = MimiModel::new(
         encoder,
         decoder,
         encoder_transformer,
@@ -414,6 +266,49 @@ fn mimi_encode_decode_matches_fixture() {
         None,
         None,
     );
+
+    let state = load_mimi_state_dict("tests/fixtures/mimi_state.safetensors")
+        .expect("load mimi state dict");
+    mimi
+        .load_state_dict(&state, device)
+        .expect("apply mimi state dict");
+    mimi
+}
+
+fn tensor3_from_state_data(
+    data: &guth::weights::TensorData,
+    device: &NdArrayDevice,
+) -> Tensor<TestBackend, 3> {
+    let shape = [data.shape[0], data.shape[1], data.shape[2]];
+    let mut values = Vec::with_capacity(data.data.len() / 4);
+    for chunk in data.data.chunks_exact(4) {
+        values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    Tensor::from_data(TensorData::new(values, shape), device)
+}
+
+#[test]
+fn dummy_quantizer_matches_fixture() {
+    let device = NdArrayDevice::default();
+    let fixture: DummyQuantizerFixture = read_fixture("dummy_quantizer.json");
+
+    let state = load_mimi_state_dict("tests/fixtures/mimi_state.safetensors")
+        .expect("load mimi state dict");
+    let weight_data = state.get("quantizer.weight").expect("quantizer weight");
+    let weight = tensor3_from_state_data(weight_data, &device);
+    let quantizer = DummyQuantizer::new(weight);
+    let input = tensor3_from_nested(fixture.input, &device);
+    let output = quantizer.forward(input).to_data();
+    let expected = tensor3_from_nested(fixture.output, &device).to_data();
+    assert_close(&output, &expected, 1e-4);
+}
+
+#[test]
+fn mimi_encode_decode_matches_fixture() {
+    let device = NdArrayDevice::default();
+    let fixture: MimiFixture = read_fixture("mimi_model.json");
+
+    let mimi = build_mimi(&fixture, &device);
 
     let audio_input = tensor3_from_nested(fixture.audio_input, &device);
     let latent_output = mimi.encode_to_latent(audio_input).to_data();
@@ -432,29 +327,7 @@ fn mimi_streaming_decode_matches_batch() {
     let device = NdArrayDevice::default();
     let fixture: MimiFixture = read_fixture("mimi_model.json");
 
-    let encoder = build_seanet_encoder(&device);
-    let decoder = build_seanet_decoder(&device);
-    let encoder_transformer =
-        build_projected_transformer(&fixture.encoder_transformer, &fixture.config.transformer, &device);
-    let decoder_transformer =
-        build_projected_transformer(&fixture.decoder_transformer, &fixture.config.transformer, &device);
-    let quantizer_weight = Tensor::<TestBackend, 3>::zeros([1, 1, 1], &device);
-    let quantizer = DummyQuantizer::new(quantizer_weight);
-
-    let mimi = MimiModel::new(
-        encoder,
-        decoder,
-        encoder_transformer,
-        decoder_transformer,
-        quantizer,
-        fixture.config.frame_rate,
-        fixture.config.encoder_frame_rate,
-        fixture.config.sample_rate,
-        fixture.config.channels,
-        fixture.config.dimension,
-        None,
-        None,
-    );
+    let mimi = build_mimi(&fixture, &device);
 
     let latent_input = tensor3_from_nested(fixture.latent_input, &device);
     let mut batch_state = mimi.init_state(1, latent_input.dims()[2], &device);
@@ -482,29 +355,7 @@ fn mimi_streaming_decode_unaligned_chunks_matches_batch() {
     let device = NdArrayDevice::default();
     let fixture: MimiFixture = read_fixture("mimi_model.json");
 
-    let encoder = build_seanet_encoder(&device);
-    let decoder = build_seanet_decoder(&device);
-    let encoder_transformer =
-        build_projected_transformer(&fixture.encoder_transformer, &fixture.config.transformer, &device);
-    let decoder_transformer =
-        build_projected_transformer(&fixture.decoder_transformer, &fixture.config.transformer, &device);
-    let quantizer_weight = Tensor::<TestBackend, 3>::zeros([1, 1, 1], &device);
-    let quantizer = DummyQuantizer::new(quantizer_weight);
-
-    let mimi = MimiModel::new(
-        encoder,
-        decoder,
-        encoder_transformer,
-        decoder_transformer,
-        quantizer,
-        fixture.config.frame_rate,
-        fixture.config.encoder_frame_rate,
-        fixture.config.sample_rate,
-        fixture.config.channels,
-        fixture.config.dimension,
-        None,
-        None,
-    );
+    let mimi = build_mimi(&fixture, &device);
 
     let latent_input = tensor3_from_nested(fixture.latent_input, &device);
     let mut batch_state = mimi.init_state(1, latent_input.dims()[2], &device);
@@ -535,8 +386,8 @@ fn mimi_transformer_streaming_matches_batch() {
     let device = NdArrayDevice::default();
     let fixture: MimiFixture = read_fixture("mimi_model.json");
 
-    let transformer =
-        build_projected_transformer(&fixture.decoder_transformer, &fixture.config.transformer, &device);
+    let mimi = build_mimi(&fixture, &device);
+    let transformer = mimi.decoder_transformer;
     let input = tensor3_from_nested(fixture.latent_input, &device);
 
     let mut batch_state = transformer.init_state(1, &device);

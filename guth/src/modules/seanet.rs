@@ -12,7 +12,7 @@ fn elu<B: Backend>(input: Tensor<B, 3>, alpha: f32) -> Tensor<B, 3> {
 
 #[derive(Debug, Clone)]
 pub struct SeanetResnetBlock<B: Backend> {
-    convs: Vec<StreamingConv1dOp<B>>,
+    pub(crate) convs: Vec<StreamingConv1dOp<B>>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,12 +74,12 @@ impl<B: Backend> SeanetState<B> {
 
 #[derive(Debug, Clone)]
 pub struct SeanetEncoder<B: Backend> {
-    layers: Vec<SeanetLayer<B>>,
+    pub(crate) layers: Vec<SeanetLayer<B>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SeanetDecoder<B: Backend> {
-    layers: Vec<SeanetLayer<B>>,
+    pub(crate) layers: Vec<SeanetLayer<B>>,
 }
 
 impl<B: Backend> SeanetEncoder<B> {

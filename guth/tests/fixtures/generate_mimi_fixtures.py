@@ -3,6 +3,7 @@ import pathlib
 from typing import Iterable
 
 import torch
+import safetensors.torch
 
 from pocket_tts.modules.dummy_quantizer import DummyQuantizer
 from pocket_tts.modules.mimi_transformer import ProjectedTransformer
@@ -123,6 +124,43 @@ def serialize_projected_transformer(model: ProjectedTransformer):
     }
 
 
+def add_seanet_weights(state: dict[str, torch.Tensor], prefix: str, model: torch.nn.Module):
+    for idx, layer in enumerate(model.model):
+        if isinstance(layer, StreamingConv1d):
+            state[f"{prefix}.layers.{idx}.conv.weight"] = layer.conv.weight
+            state[f"{prefix}.layers.{idx}.conv.bias"] = layer.conv.bias
+        elif isinstance(layer, StreamingConvTranspose1d):
+            state[f"{prefix}.layers.{idx}.conv_transpose.weight"] = layer.convtr.weight
+            state[f"{prefix}.layers.{idx}.conv_transpose.bias"] = layer.convtr.bias
+        elif isinstance(layer, SEANetResnetBlock):
+            convs = [block for block in layer.block if isinstance(block, StreamingConv1d)]
+            for conv_idx, conv in enumerate(convs):
+                state[f"{prefix}.layers.{idx}.resblock.{conv_idx}.weight"] = conv.conv.weight
+                state[f"{prefix}.layers.{idx}.resblock.{conv_idx}.bias"] = conv.conv.bias
+
+
+def add_projected_transformer_weights(
+    state: dict[str, torch.Tensor], prefix: str, transformer: ProjectedTransformer
+):
+    if transformer.input_proj is not None:
+        state[f"{prefix}.input_proj.weight"] = transformer.input_proj.weight
+    for idx, proj in enumerate(transformer.output_projs):
+        if isinstance(proj, torch.nn.Identity):
+            continue
+        state[f"{prefix}.output_projs.{idx}.weight"] = proj.weight
+    for idx, layer in enumerate(transformer.transformer.layers):
+        state[f"{prefix}.layers.{idx}.self_attn.in_proj.weight"] = layer.self_attn.in_proj.weight
+        state[f"{prefix}.layers.{idx}.self_attn.out_proj.weight"] = layer.self_attn.out_proj.weight
+        state[f"{prefix}.layers.{idx}.norm1.weight"] = layer.norm1.weight
+        state[f"{prefix}.layers.{idx}.norm1.bias"] = layer.norm1.bias
+        state[f"{prefix}.layers.{idx}.norm2.weight"] = layer.norm2.weight
+        state[f"{prefix}.layers.{idx}.norm2.bias"] = layer.norm2.bias
+        state[f"{prefix}.layers.{idx}.linear1.weight"] = layer.linear1.weight
+        state[f"{prefix}.layers.{idx}.linear2.weight"] = layer.linear2.weight
+        state[f"{prefix}.layers.{idx}.layer_scale_1.scale"] = layer.layer_scale_1.scale
+        state[f"{prefix}.layers.{idx}.layer_scale_2.scale"] = layer.layer_scale_2.scale
+
+
 def main():
     torch.manual_seed(11)
 
@@ -194,6 +232,15 @@ def main():
 
     with (FIXTURES / "mimi_model.json").open("w", encoding="utf-8") as f:
         json.dump(fixture, f, indent=2)
+
+    state = {}
+    add_seanet_weights(state, "encoder", encoder)
+    add_seanet_weights(state, "decoder", decoder)
+    add_projected_transformer_weights(state, "encoder_transformer", encoder_transformer)
+    add_projected_transformer_weights(state, "decoder_transformer", decoder_transformer)
+    state["quantizer.weight"] = quantizer.output_proj.weight
+    state = {key: value.contiguous() for key, value in state.items()}
+    safetensors.torch.save_file(state, FIXTURES / "mimi_state.safetensors")
 
     quantizer_input = torch.randn(1, 4, 5)
     quantizer_output = quantizer(quantizer_input)
