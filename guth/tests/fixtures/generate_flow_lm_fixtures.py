@@ -219,6 +219,14 @@ def main() -> None:
     with (FIXTURES / "flow_lm_model.json").open("w", encoding="utf-8") as f:
         json.dump(fixture, f, indent=2)
 
+    import safetensors.torch
+
+    state = {key: value.contiguous() for key, value in model.state_dict().items()}
+    safetensors.torch.save_file(
+        state,
+        FIXTURES / "flow_lm_state.safetensors",
+    )
+
 
 if __name__ == "__main__":
     main()

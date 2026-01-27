@@ -1,4 +1,3 @@
-use burn::module::Param;
 use burn::tensor::{Bool, Int, Tensor, TensorData, Tolerance};
 use burn_ndarray::{NdArray, NdArrayDevice};
 use serde::Deserialize;
@@ -10,6 +9,7 @@ use guth::modules::transformer::{
     StreamingTransformer, StreamingTransformerConfig, StreamingTransformerLayerConfig,
 };
 use guth::state::StreamingModule;
+use guth::weights::load_flow_lm_state_dict;
 
 const FIXTURE_DIR: &str = "tests/fixtures";
 type TestBackend = NdArray<f32>;
@@ -18,13 +18,6 @@ type TestBackend = NdArray<f32>;
 struct FlowLmFixture {
     config: FlowLmConfig,
     conditioner: ConditionerFixture,
-    input_linear_weight: Vec<Vec<f32>>,
-    bos_emb: Vec<f32>,
-    emb_mean: Vec<f32>,
-    emb_std: Vec<f32>,
-    transformer: TransformerFixture,
-    out_norm: NormFixture,
-    out_eos: LinearFixture,
     sequence: Vec<Vec<Vec<f32>>>,
     sequence_nan_mask: Vec<Vec<Vec<bool>>>,
     input_linear: Vec<Vec<Vec<f32>>>,
@@ -50,47 +43,13 @@ struct FlowLmConfig {
 #[derive(Debug, Deserialize)]
 struct ConditionerFixture {
     n_bins: usize,
-    embed_weight: Vec<Vec<f32>>,
     tokens: Vec<Vec<i64>>,
     text_embeddings: Vec<Vec<Vec<f32>>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct TransformerFixture {
-    layers: Vec<TransformerLayerFixture>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TransformerLayerFixture {
-    self_attn: SelfAttnFixture,
-    norm1: NormFixture,
-    norm2: NormFixture,
-    linear1: LinearFixture,
-    linear2: LinearFixture,
-}
-
-#[derive(Debug, Deserialize)]
-struct SelfAttnFixture {
-    in_proj: LinearFixture,
-    out_proj: LinearFixture,
-}
-
-#[derive(Debug, Deserialize)]
-struct LinearFixture {
-    weight: Vec<Vec<f32>>,
-    bias: Option<Vec<f32>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NormFixture {
-    gamma: Vec<f32>,
-    beta: Vec<f32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FlowNetFixture {
+struct FlowNetConfigFixture {
     config: FlowNetConfig,
-    weights: FlowNetWeights,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,59 +64,10 @@ struct FlowNetConfig {
     max_period: f32,
 }
 
-#[derive(Debug, Deserialize)]
-struct FlowNetWeights {
-    input_proj: LinearWeights,
-    cond_embed: LinearWeights,
-    time_embed: Vec<TimeEmbedWeights>,
-    res_blocks: Vec<ResBlockWeights>,
-    final_layer: FinalLayerWeights,
-}
-
-#[derive(Debug, Deserialize)]
-struct LinearWeights {
-    weight: Vec<Vec<f32>>,
-    bias: Vec<f32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NormWeights {
-    weight: Vec<f32>,
-    bias: Option<Vec<f32>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TimeEmbedWeights {
-    proj_in: LinearWeights,
-    proj_out: LinearWeights,
-    rms_weight: Vec<f32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResBlockWeights {
-    norm: NormWeights,
-    mlp_in: LinearWeights,
-    mlp_out: LinearWeights,
-    modulation: LinearWeights,
-}
-
-#[derive(Debug, Deserialize)]
-struct FinalLayerWeights {
-    norm: NormWeights,
-    linear: LinearWeights,
-    modulation: LinearWeights,
-}
-
 fn read_fixture<T: for<'de> Deserialize<'de>>(name: &str) -> T {
     let path = format!("{FIXTURE_DIR}/{name}");
     let data = std::fs::read_to_string(path).expect("fixture read");
     serde_json::from_str(&data).expect("fixture parse")
-}
-
-fn tensor1(device: &NdArrayDevice, data: Vec<f32>) -> Tensor<TestBackend, 1> {
-    let len = data.len();
-    let td = TensorData::new(data, [len]);
-    Tensor::from_data(td, device)
 }
 
 fn tensor2(device: &NdArrayDevice, data: Vec<Vec<f32>>) -> Tensor<TestBackend, 2> {
@@ -208,30 +118,6 @@ fn tensor3_bool(device: &NdArrayDevice, data: Vec<Vec<Vec<bool>>>) -> Tensor<Tes
     Tensor::from_data(td, device)
 }
 
-fn apply_linear(linear: &mut burn_nn::Linear<TestBackend>, weights: &LinearFixture, device: &NdArrayDevice) {
-    let out_dim = weights.weight.len();
-    let in_dim = weights.weight[0].len();
-    let mut flat = Vec::with_capacity(in_dim * out_dim);
-    for c in 0..in_dim {
-        for r in 0..out_dim {
-            flat.push(weights.weight[r][c]);
-        }
-    }
-    let weight = Tensor::from_data(TensorData::new(flat, [in_dim, out_dim]), device);
-    linear.weight = Param::from_tensor(weight);
-    if let Some(bias) = &weights.bias {
-        let bias = Tensor::from_data(TensorData::new(bias.clone(), [bias.len()]), device);
-        linear.bias = Some(Param::from_tensor(bias));
-    }
-}
-
-fn apply_norm(norm: &mut burn_nn::LayerNorm<TestBackend>, weights: &NormFixture, device: &NdArrayDevice) {
-    let gamma = tensor1(device, weights.gamma.clone());
-    let beta = tensor1(device, weights.beta.clone());
-    norm.gamma = Param::from_tensor(gamma);
-    norm.beta = Some(Param::from_tensor(beta));
-}
-
 fn linear_3d(
     linear: &burn_nn::Linear<TestBackend>,
     input: Tensor<TestBackend, 3>,
@@ -253,40 +139,8 @@ fn norm_3d(
     output.reshape([batch, seq, dim])
 }
 
-fn apply_flow_linear(
-    linear: &mut burn_nn::Linear<TestBackend>,
-    weights: &LinearWeights,
-    device: &NdArrayDevice,
-) {
-    let rows = weights.weight.len();
-    let cols = weights.weight[0].len();
-    let flat: Vec<f32> = weights.weight.clone().into_iter().flatten().collect();
-    let weight = Tensor::from_data(TensorData::new(flat, [rows, cols]), device);
-    linear.weight = Param::from_tensor(weight);
-    let bias = Tensor::from_data(TensorData::new(weights.bias.clone(), [weights.bias.len()]), device);
-    linear.bias = Some(Param::from_tensor(bias));
-}
-
-fn apply_flow_norm(
-    norm: &mut burn_nn::LayerNorm<TestBackend>,
-    weights: &NormWeights,
-    device: &NdArrayDevice,
-) {
-    let gamma = tensor1(device, weights.weight.clone());
-    norm.gamma = Param::from_tensor(gamma);
-    norm.beta = weights.bias.as_ref().map(|bias| {
-        let beta = tensor1(device, bias.clone());
-        Param::from_tensor(beta)
-    });
-}
-
-fn apply_rms(norm: &mut guth::modules::flow_net::RmsNorm<TestBackend>, weights: &[f32], device: &NdArrayDevice) {
-    let gamma = tensor1(device, weights.to_vec());
-    norm.gamma = Param::from_tensor(gamma);
-}
-
 fn build_flow_net(device: &NdArrayDevice) -> SimpleMlpAdaLn<TestBackend> {
-    let fixture: FlowNetFixture = read_fixture("flow_net.json");
+    let fixture: FlowNetConfigFixture = read_fixture("flow_net.json");
 
     let mut config = SimpleMlpAdaLnConfig::new(
         fixture.config.in_channels,
@@ -299,32 +153,7 @@ fn build_flow_net(device: &NdArrayDevice) -> SimpleMlpAdaLn<TestBackend> {
     config.time_embed.frequency_embedding_size = fixture.config.frequency_embedding_size;
     config.time_embed.max_period = fixture.config.max_period;
 
-    let mut model = SimpleMlpAdaLn::<TestBackend>::new(config, device);
-    apply_flow_linear(&mut model.input_proj, &fixture.weights.input_proj, device);
-    apply_flow_linear(&mut model.cond_embed, &fixture.weights.cond_embed, device);
-
-    for (embedder, weights) in model.time_embed.iter_mut().zip(fixture.weights.time_embed.iter()) {
-        apply_flow_linear(&mut embedder.proj_in, &weights.proj_in, device);
-        apply_flow_linear(&mut embedder.proj_out, &weights.proj_out, device);
-        apply_rms(&mut embedder.norm, &weights.rms_weight, device);
-    }
-
-    for (block, weights) in model.res_blocks.iter_mut().zip(fixture.weights.res_blocks.iter()) {
-        apply_flow_norm(&mut block.norm, &weights.norm, device);
-        apply_flow_linear(&mut block.mlp_in, &weights.mlp_in, device);
-        apply_flow_linear(&mut block.mlp_out, &weights.mlp_out, device);
-        apply_flow_linear(&mut block.mod_linear, &weights.modulation, device);
-    }
-
-    apply_flow_norm(&mut model.final_layer.norm, &fixture.weights.final_layer.norm, device);
-    apply_flow_linear(&mut model.final_layer.linear, &fixture.weights.final_layer.linear, device);
-    apply_flow_linear(
-        &mut model.final_layer.mod_linear,
-        &fixture.weights.final_layer.modulation,
-        device,
-    );
-
-    model
+    SimpleMlpAdaLn::<TestBackend>::new(config, device)
 }
 
 #[test]
@@ -332,17 +161,15 @@ fn flow_lm_matches_fixture() {
     let device = NdArrayDevice::default();
     let fixture: FlowLmFixture = read_fixture("flow_lm_model.json");
 
-    let embed_weight = tensor2(&device, fixture.conditioner.embed_weight);
-    let embed_rows = embed_weight.dims()[0];
-    let embed_cols = embed_weight.dims()[1];
-    let embed = burn_nn::EmbeddingConfig::new(embed_rows, embed_cols).init::<TestBackend>(&device);
-    let mut conditioner = LutConditioner {
+    let embed =
+        burn_nn::EmbeddingConfig::new(fixture.conditioner.n_bins, fixture.config.dim)
+            .init::<TestBackend>(&device);
+    let conditioner = LutConditioner {
         tokenizer: None,
         embed,
         dim: fixture.config.dim,
         output_dim: fixture.config.dim,
     };
-    conditioner.embed.weight = Param::from_tensor(embed_weight);
 
     let transformer_config = StreamingTransformerConfig {
         num_layers: fixture.config.num_layers,
@@ -357,51 +184,20 @@ fn flow_lm_matches_fixture() {
             layer_scale: None,
         },
     };
-    let mut transformer = StreamingTransformer::<TestBackend>::new(transformer_config, &device);
-
-    for (layer, weights) in transformer.layers.iter_mut().zip(fixture.transformer.layers.iter()) {
-        apply_linear(&mut layer.qkv, &weights.self_attn.in_proj, &device);
-        apply_linear(&mut layer.out_proj, &weights.self_attn.out_proj, &device);
-        apply_norm(&mut layer.norm1, &weights.norm1, &device);
-        apply_norm(&mut layer.norm2, &weights.norm2, &device);
-        apply_linear(&mut layer.ffn_in, &weights.linear1, &device);
-        apply_linear(&mut layer.ffn_out, &weights.linear2, &device);
-    }
-
+    let transformer = StreamingTransformer::<TestBackend>::new(transformer_config, &device);
     let flow_net = build_flow_net(&device);
-
-    let mut input_linear = burn_nn::LinearConfig::new(fixture.config.ldim, fixture.config.dim)
+    let input_linear = burn_nn::LinearConfig::new(fixture.config.ldim, fixture.config.dim)
         .with_bias(false)
         .init::<TestBackend>(&device);
-    apply_linear(
-        &mut input_linear,
-        &LinearFixture {
-            weight: fixture.input_linear_weight,
-            bias: None,
-        },
-        &device,
-    );
-
-    let mut out_norm = burn_nn::LayerNormConfig::new(fixture.config.dim)
+    let out_norm = burn_nn::LayerNormConfig::new(fixture.config.dim)
         .init::<TestBackend>(&device);
-    apply_norm(&mut out_norm, &fixture.out_norm, &device);
-
-    let mut out_eos = burn_nn::LinearConfig::new(fixture.config.dim, 1)
+    let out_eos = burn_nn::LinearConfig::new(fixture.config.dim, 1)
         .init::<TestBackend>(&device);
-    apply_linear(&mut out_eos, &fixture.out_eos, &device);
+    let emb_mean = Tensor::<TestBackend, 1>::zeros([fixture.config.ldim], &device);
+    let emb_std = Tensor::<TestBackend, 1>::zeros([fixture.config.ldim], &device);
+    let bos_emb = Tensor::<TestBackend, 1>::zeros([fixture.config.ldim], &device);
 
-    let emb_mean = tensor1(&device, fixture.emb_mean);
-    let emb_std = tensor1(&device, fixture.emb_std);
-    let bos_emb = tensor1(&device, fixture.bos_emb);
-
-    let tokens = tensor2_int(&device, fixture.conditioner.tokens);
-    let text_embeddings = conditioner.forward_tokens(tokens);
-    text_embeddings.to_data().assert_approx_eq(
-        &tensor3(&device, fixture.conditioner.text_embeddings).to_data(),
-        Tolerance::<f32>::absolute(1e-4).set_relative(1e-4),
-    );
-
-    let model = FlowLmModel::new(
+    let mut model = FlowLmModel::new(
         conditioner,
         flow_net,
         transformer,
@@ -413,6 +209,19 @@ fn flow_lm_matches_fixture() {
         bos_emb,
         fixture.config.dim,
         fixture.config.ldim,
+    );
+
+    let state = load_flow_lm_state_dict("tests/fixtures/flow_lm_state.safetensors")
+        .expect("load flow lm state dict");
+    model
+        .load_state_dict(&state, &device)
+        .expect("apply flow lm state dict");
+
+    let tokens = tensor2_int(&device, fixture.conditioner.tokens);
+    let text_embeddings = model.conditioner.forward_tokens(tokens);
+    text_embeddings.to_data().assert_approx_eq(
+        &tensor3(&device, fixture.conditioner.text_embeddings).to_data(),
+        Tolerance::<f32>::absolute(1e-4).set_relative(1e-4),
     );
 
     let sequence_clean = tensor3(&device, fixture.sequence);

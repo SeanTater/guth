@@ -80,6 +80,7 @@ target/
 test_en_audio_4000.model
 profile_output*
 *.safetensors
+!guth/tests/fixtures/*.safetensors
 *.wav
 *.model
 !guth/tests/fixtures/*.model

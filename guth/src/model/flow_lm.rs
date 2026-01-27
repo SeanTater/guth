@@ -3,8 +3,10 @@ use crate::modules::flow_net::{lsd_decode, SimpleMlpAdaLn};
 use crate::modules::transformer::{StreamingTransformer, StreamingTransformerState};
 use crate::state::StreamingModule;
 use burn::tensor::backend::Backend;
-use burn::tensor::{Bool, Distribution, ElementConversion, Tensor};
+use burn::tensor::{Bool, Distribution, ElementConversion, Tensor, TensorData as BurnTensorData};
 use burn_nn::{LayerNorm, Linear};
+use std::collections::HashMap;
+use safetensors::Dtype;
 
 #[derive(Debug)]
 pub struct FlowLmState<B: Backend> {
@@ -142,6 +144,69 @@ impl<B: Backend> FlowLmModel<B> {
         let total_len = output.dims()[1];
         output.narrow(1, total_len - sequence_len, sequence_len)
     }
+
+    pub fn load_state_dict(
+        &mut self,
+        state: &HashMap<String, crate::weights::TensorData>,
+        device: &B::Device,
+    ) -> anyhow::Result<()> {
+        for (name, tensor) in state {
+            if name == "bos_emb" {
+                self.bos_emb = tensor1_from_data(tensor, device)?;
+                continue;
+            }
+            if name == "emb_std" {
+                self.emb_std = tensor1_from_data(tensor, device)?;
+                continue;
+            }
+            if name == "emb_mean" {
+                self.emb_mean = tensor1_from_data(tensor, device)?;
+                continue;
+            }
+            if name == "conditioner.embed.weight" {
+                let weight = tensor2_from_data(tensor, device)?;
+                self.conditioner.embed.weight = burn::module::Param::from_tensor(weight);
+                continue;
+            }
+            if name == "input_linear.weight" {
+                let weight = tensor2_from_data(tensor, device)?;
+                self.input_linear.weight = burn::module::Param::from_tensor(weight.transpose());
+                continue;
+            }
+            if name == "out_norm.weight" {
+                let weight = tensor1_from_data(tensor, device)?;
+                self.out_norm.gamma = burn::module::Param::from_tensor(weight);
+                continue;
+            }
+            if name == "out_norm.bias" {
+                let bias = tensor1_from_data(tensor, device)?;
+                self.out_norm.beta = Some(burn::module::Param::from_tensor(bias));
+                continue;
+            }
+            if name == "out_eos.weight" {
+                let weight = tensor2_from_data(tensor, device)?;
+                self.out_eos.weight = burn::module::Param::from_tensor(weight.transpose());
+                continue;
+            }
+            if name == "out_eos.bias" {
+                let bias = tensor1_from_data(tensor, device)?;
+                self.out_eos.bias = Some(burn::module::Param::from_tensor(bias));
+                continue;
+            }
+
+            if let Some(rest) = name.strip_prefix("transformer.layers.") {
+                apply_transformer_weight(&mut self.transformer, rest, tensor, device)?;
+                continue;
+            }
+
+            if let Some(rest) = name.strip_prefix("flow_net.") {
+                apply_flow_net_weight(&mut self.flow_net, rest, tensor, device)?;
+                continue;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 fn apply_linear_3d<B: Backend>(linear: &Linear<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
@@ -163,6 +228,234 @@ fn apply_layer_norm_3d<B: Backend>(norm: &LayerNorm<B>, input: Tensor<B, 3>) -> 
     let flat = input.reshape([batch * seq, dim]);
     let output = norm.forward(flat);
     output.reshape([batch, seq, dim])
+}
+
+fn tensor_f32(tensor: &crate::weights::TensorData) -> anyhow::Result<Vec<f32>> {
+    if tensor.dtype != Dtype::F32 {
+        anyhow::bail!("Unsupported dtype {:?}", tensor.dtype);
+    }
+    let mut values = Vec::with_capacity(tensor.data.len() / 4);
+    for chunk in tensor.data.chunks_exact(4) {
+        values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    Ok(values)
+}
+
+fn tensor1_from_data<B: Backend>(
+    tensor: &crate::weights::TensorData,
+    device: &B::Device,
+) -> anyhow::Result<Tensor<B, 1>> {
+    let shape: [usize; 1] = tensor.shape.clone().try_into().map_err(|_| {
+        anyhow::anyhow!("Expected 1D tensor, got shape {:?}", tensor.shape)
+    })?;
+    let values = tensor_f32(tensor)?;
+    Ok(Tensor::from_data(BurnTensorData::new(values, shape), device))
+}
+
+fn tensor2_from_data<B: Backend>(
+    tensor: &crate::weights::TensorData,
+    device: &B::Device,
+) -> anyhow::Result<Tensor<B, 2>> {
+    let shape: [usize; 2] = tensor.shape.clone().try_into().map_err(|_| {
+        anyhow::anyhow!("Expected 2D tensor, got shape {:?}", tensor.shape)
+    })?;
+    let values = tensor_f32(tensor)?;
+    Ok(Tensor::from_data(BurnTensorData::new(values, shape), device))
+}
+
+fn apply_transformer_weight<B: Backend>(
+    transformer: &mut StreamingTransformer<B>,
+    rest: &str,
+    tensor: &crate::weights::TensorData,
+    device: &B::Device,
+) -> anyhow::Result<()> {
+    let mut parts = rest.split('.');
+    let layer_idx: usize = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing layer index"))?
+        .parse()?;
+    let layer = transformer
+        .layers
+        .get_mut(layer_idx)
+        .ok_or_else(|| anyhow::anyhow!("invalid layer index {layer_idx}"))?;
+    let tail: Vec<&str> = parts.collect();
+    match tail.as_slice() {
+        ["self_attn", "in_proj", "weight"] => {
+            let weight = tensor2_from_data(tensor, device)?;
+            layer.qkv.weight = burn::module::Param::from_tensor(weight.transpose());
+        }
+        ["self_attn", "out_proj", "weight"] => {
+            let weight = tensor2_from_data(tensor, device)?;
+            layer.out_proj.weight = burn::module::Param::from_tensor(weight.transpose());
+        }
+        ["norm1", "weight"] => {
+            let weight = tensor1_from_data(tensor, device)?;
+            layer.norm1.gamma = burn::module::Param::from_tensor(weight);
+        }
+        ["norm1", "bias"] => {
+            let bias = tensor1_from_data(tensor, device)?;
+            layer.norm1.beta = Some(burn::module::Param::from_tensor(bias));
+        }
+        ["norm2", "weight"] => {
+            let weight = tensor1_from_data(tensor, device)?;
+            layer.norm2.gamma = burn::module::Param::from_tensor(weight);
+        }
+        ["norm2", "bias"] => {
+            let bias = tensor1_from_data(tensor, device)?;
+            layer.norm2.beta = Some(burn::module::Param::from_tensor(bias));
+        }
+        ["linear1", "weight"] => {
+            let weight = tensor2_from_data(tensor, device)?;
+            layer.ffn_in.weight = burn::module::Param::from_tensor(weight.transpose());
+        }
+        ["linear2", "weight"] => {
+            let weight = tensor2_from_data(tensor, device)?;
+            layer.ffn_out.weight = burn::module::Param::from_tensor(weight.transpose());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn apply_flow_net_weight<B: Backend>(
+    flow_net: &mut SimpleMlpAdaLn<B>,
+    rest: &str,
+    tensor: &crate::weights::TensorData,
+    device: &B::Device,
+) -> anyhow::Result<()> {
+    if rest == "cond_embed.weight" {
+        let weight = tensor2_from_data(tensor, device)?;
+        flow_net.cond_embed.weight = burn::module::Param::from_tensor(weight.transpose());
+        return Ok(());
+    }
+    if rest == "cond_embed.bias" {
+        let bias = tensor1_from_data(tensor, device)?;
+        flow_net.cond_embed.bias = Some(burn::module::Param::from_tensor(bias));
+        return Ok(());
+    }
+    if rest == "input_proj.weight" {
+        let weight = tensor2_from_data(tensor, device)?;
+        flow_net.input_proj.weight = burn::module::Param::from_tensor(weight.transpose());
+        return Ok(());
+    }
+    if rest == "input_proj.bias" {
+        let bias = tensor1_from_data(tensor, device)?;
+        flow_net.input_proj.bias = Some(burn::module::Param::from_tensor(bias));
+        return Ok(());
+    }
+    if let Some(rest) = rest.strip_prefix("time_embed.") {
+        let mut parts = rest.split('.');
+        let idx: usize = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing time embed index"))?
+            .parse()?;
+        let embedder = flow_net
+            .time_embed
+            .get_mut(idx)
+            .ok_or_else(|| anyhow::anyhow!("invalid time embed index {idx}"))?;
+        let tail: Vec<&str> = parts.collect();
+        match tail.as_slice() {
+            ["freqs"] => {
+                embedder.freqs = tensor1_from_data(tensor, device)?;
+            }
+            ["mlp", "0", "weight"] => {
+                let weight = tensor2_from_data(tensor, device)?;
+                embedder.proj_in.weight = burn::module::Param::from_tensor(weight.transpose());
+            }
+            ["mlp", "0", "bias"] => {
+                let bias = tensor1_from_data(tensor, device)?;
+                embedder.proj_in.bias = Some(burn::module::Param::from_tensor(bias));
+            }
+            ["mlp", "2", "weight"] => {
+                let weight = tensor2_from_data(tensor, device)?;
+                embedder.proj_out.weight = burn::module::Param::from_tensor(weight.transpose());
+            }
+            ["mlp", "2", "bias"] => {
+                let bias = tensor1_from_data(tensor, device)?;
+                embedder.proj_out.bias = Some(burn::module::Param::from_tensor(bias));
+            }
+            ["mlp", "3", "alpha"] => {
+                let weight = tensor1_from_data(tensor, device)?;
+                embedder.norm.gamma = burn::module::Param::from_tensor(weight);
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    if let Some(rest) = rest.strip_prefix("res_blocks.") {
+        let mut parts = rest.split('.');
+        let idx: usize = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing resblock index"))?
+            .parse()?;
+        let block = flow_net
+            .res_blocks
+            .get_mut(idx)
+            .ok_or_else(|| anyhow::anyhow!("invalid resblock index {idx}"))?;
+        let tail: Vec<&str> = parts.collect();
+        match tail.as_slice() {
+            ["in_ln", "weight"] => {
+                let weight = tensor1_from_data(tensor, device)?;
+                block.norm.gamma = burn::module::Param::from_tensor(weight);
+            }
+            ["in_ln", "bias"] => {
+                let bias = tensor1_from_data(tensor, device)?;
+                block.norm.beta = Some(burn::module::Param::from_tensor(bias));
+            }
+            ["mlp", "0", "weight"] => {
+                let weight = tensor2_from_data(tensor, device)?;
+                block.mlp_in.weight = burn::module::Param::from_tensor(weight.transpose());
+            }
+            ["mlp", "0", "bias"] => {
+                let bias = tensor1_from_data(tensor, device)?;
+                block.mlp_in.bias = Some(burn::module::Param::from_tensor(bias));
+            }
+            ["mlp", "2", "weight"] => {
+                let weight = tensor2_from_data(tensor, device)?;
+                block.mlp_out.weight = burn::module::Param::from_tensor(weight.transpose());
+            }
+            ["mlp", "2", "bias"] => {
+                let bias = tensor1_from_data(tensor, device)?;
+                block.mlp_out.bias = Some(burn::module::Param::from_tensor(bias));
+            }
+            ["adaLN_modulation", "1", "weight"] => {
+                let weight = tensor2_from_data(tensor, device)?;
+                block.mod_linear.weight = burn::module::Param::from_tensor(weight.transpose());
+            }
+            ["adaLN_modulation", "1", "bias"] => {
+                let bias = tensor1_from_data(tensor, device)?;
+                block.mod_linear.bias = Some(burn::module::Param::from_tensor(bias));
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    if let Some(rest) = rest.strip_prefix("final_layer.") {
+        let tail: Vec<&str> = rest.split('.').collect();
+        match tail.as_slice() {
+            ["linear", "weight"] => {
+                let weight = tensor2_from_data(tensor, device)?;
+                flow_net.final_layer.linear.weight =
+                    burn::module::Param::from_tensor(weight.transpose());
+            }
+            ["linear", "bias"] => {
+                let bias = tensor1_from_data(tensor, device)?;
+                flow_net.final_layer.linear.bias = Some(burn::module::Param::from_tensor(bias));
+            }
+            ["adaLN_modulation", "1", "weight"] => {
+                let weight = tensor2_from_data(tensor, device)?;
+                flow_net.final_layer.mod_linear.weight =
+                    burn::module::Param::from_tensor(weight.transpose());
+            }
+            ["adaLN_modulation", "1", "bias"] => {
+                let bias = tensor1_from_data(tensor, device)?;
+                flow_net.final_layer.mod_linear.bias =
+                    Some(burn::module::Param::from_tensor(bias));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn make_noise<B: Backend>(
