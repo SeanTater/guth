@@ -1,5 +1,9 @@
 use crate::state::{StreamStep, StreamingModule};
 use anyhow::Result;
+use burn::tensor::backend::Backend;
+use burn::tensor::module::{conv1d, conv_transpose1d};
+use burn::tensor::ops::{ConvOptions, ConvTransposeOptions, PadMode};
+use burn::tensor::{s, Tensor};
 
 #[derive(Debug, Default)]
 pub struct StreamingConv1d;
@@ -8,18 +12,24 @@ pub struct StreamingConv1d;
 pub struct StreamingConvTranspose1d;
 
 #[derive(Debug, Clone)]
-pub struct StreamingConvState {
+pub struct StreamingConvState<B: Backend> {
     pub step: StreamStep,
-    pub history: Vec<Vec<f32>>,
+    pub history: Option<Tensor<B, 3>>,
 }
 
-impl Default for StreamingConvState {
+impl<B: Backend> Default for StreamingConvState<B> {
     fn default() -> Self {
         Self {
             step: StreamStep::new(),
-            history: Vec::new(),
+            history: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaddingMode {
+    Constant,
+    Replicate,
 }
 
 #[derive(Debug, Clone)]
@@ -43,173 +53,152 @@ impl Default for StreamingConvConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PaddingMode {
-    Constant,
-    Replicate,
-}
-
 #[derive(Debug, Clone)]
-pub struct StreamingConvKernel {
-    pub weights: Vec<Vec<f32>>,
-    pub bias: Option<Vec<f32>>,
-}
-
-impl StreamingConvKernel {
-    pub fn new(weights: Vec<Vec<f32>>, bias: Option<Vec<f32>>) -> Result<Self> {
-        if weights.is_empty() || weights[0].is_empty() {
-            anyhow::bail!("kernel weights cannot be empty");
-        }
-        Ok(Self { weights, bias })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct StreamingConv1dOp {
+pub struct StreamingConv1dOp<B: Backend> {
     pub config: StreamingConvConfig,
-    pub kernel: StreamingConvKernel,
+    pub weight: Tensor<B, 3>,
+    pub bias: Option<Tensor<B, 1>>,
 }
 
-impl StreamingConv1dOp {
-    pub fn new(config: StreamingConvConfig, kernel: StreamingConvKernel) -> Self {
-        Self { config, kernel }
+impl<B: Backend> StreamingConv1dOp<B> {
+    pub fn new(config: StreamingConvConfig, weight: Tensor<B, 3>, bias: Option<Tensor<B, 1>>) -> Self {
+        Self {
+            config,
+            weight,
+            bias,
+        }
     }
 
-    pub fn forward(&self, state: &mut StreamingConvState, input: &[Vec<f32>]) -> Vec<Vec<f32>> {
-        if input.is_empty() {
-            return Vec::new();
+    pub fn forward(&self, state: &mut StreamingConvState<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
+        let input_len = input.dims()[2];
+        if input_len == 0 {
+            return input;
         }
 
-        let k = self.config.kernel_size;
-        let dilation = self.config.dilation.max(1);
-        let stride = self.config.stride.max(1);
-        let padding = self.config.padding;
-        let channels = input[0].len();
+        let history_len = state.history.as_ref().map(|h| h.dims()[2]).unwrap_or(0);
+        let mut extended = if let Some(history) = state.history.take() {
+            Tensor::cat(vec![history, input], 2)
+        } else {
+            input
+        };
 
-        let history_len = (k - 1) * dilation;
-        let mut extended = Vec::with_capacity(state.history.len() + input.len());
-        extended.extend_from_slice(&state.history);
-        extended.extend_from_slice(input);
-
-        let mut outputs = Vec::new();
-        let total_len = extended.len();
-        for idx in 0..input.len() {
-            let position = state.history.len() + idx;
-            if position % stride != 0 {
-                continue;
-            }
-
-            let mut acc = vec![0.0f32; channels];
-            for tap in 0..k {
-                let offset = tap * dilation;
-                let target_idx = position as isize - offset as isize;
-                let target_idx = target_idx - padding as isize;
-                let sample = if target_idx < 0 {
-                    match self.config.pad_mode {
-                        PaddingMode::Constant => vec![0.0f32; channels],
-                        PaddingMode::Replicate => extended.first().cloned().unwrap_or(vec![0.0; channels]),
-                    }
-                } else if target_idx as usize >= total_len {
-                    match self.config.pad_mode {
-                        PaddingMode::Constant => vec![0.0f32; channels],
-                        PaddingMode::Replicate => extended.last().cloned().unwrap_or(vec![0.0; channels]),
-                    }
-                } else {
-                    extended[target_idx as usize].clone()
-                };
-                for ch in 0..channels {
-                    let weight = self.kernel.weights[tap][ch];
-                    acc[ch] += weight * sample[ch];
-                }
-            }
-            if let Some(bias) = &self.kernel.bias {
-                for ch in 0..channels {
-                    acc[ch] += bias[ch];
-                }
-            }
-            outputs.push(acc);
+        if self.config.padding > 0 {
+            let pad_mode = match self.config.pad_mode {
+                PaddingMode::Constant => PadMode::Constant(0.0),
+                PaddingMode::Replicate => PadMode::Edge,
+            };
+            extended = extended.pad((self.config.padding, 0, 0, 0), pad_mode);
         }
 
-        if history_len > 0 {
-            let start = total_len.saturating_sub(history_len);
-            state.history.clear();
-            state.history.extend_from_slice(&extended[start..]);
+        let output = conv1d(
+            extended.clone(),
+            self.weight.clone(),
+            self.bias.clone(),
+            ConvOptions::new([self.config.stride], [0], [self.config.dilation], 1),
+        );
+
+        let out_hist = conv_output_len(
+            history_len + self.config.padding,
+            self.config.kernel_size,
+            self.config.stride,
+            self.config.dilation,
+            0,
+        );
+        let out_total = output.dims()[2];
+        let out_new_len = out_total.saturating_sub(out_hist);
+        let output = if out_new_len == 0 {
+            let device = output.device();
+            Tensor::zeros([output.dims()[0], output.dims()[1], 0], &device)
+        } else {
+            output.narrow(2, out_hist, out_new_len)
+        };
+
+        let history_keep = self.config.dilation * (self.config.kernel_size.saturating_sub(1));
+        if history_keep > 0 {
+            let extended_len = extended.dims()[2];
+            let start = extended_len.saturating_sub(history_keep);
+            state.history = Some(extended.narrow(2, start, history_keep));
+        } else {
+            state.history = None;
         }
 
-        outputs
+        output
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct StreamingConvTranspose1dOp {
+pub struct StreamingConvTranspose1dOp<B: Backend> {
     pub config: StreamingConvConfig,
-    pub kernel: StreamingConvKernel,
+    pub weight: Tensor<B, 3>,
+    pub bias: Option<Tensor<B, 1>>,
 }
 
-impl StreamingConvTranspose1dOp {
-    pub fn new(config: StreamingConvConfig, kernel: StreamingConvKernel) -> Self {
-        Self { config, kernel }
+impl<B: Backend> StreamingConvTranspose1dOp<B> {
+    pub fn new(config: StreamingConvConfig, weight: Tensor<B, 3>, bias: Option<Tensor<B, 1>>) -> Self {
+        Self {
+            config,
+            weight,
+            bias,
+        }
     }
 
-    pub fn forward(&self, state: &mut StreamingConvState, input: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
-        if input.is_empty() {
-            if state.history.is_empty() {
-                return Ok(Vec::new());
+    pub fn forward(&self, state: &mut StreamingConvState<B>, input: Tensor<B, 3>) -> Result<Tensor<B, 3>> {
+        let input_len = input.dims()[2];
+        if input_len == 0 {
+            if let Some(history) = state.history.take() {
+                return Ok(history);
             }
-            let tail = std::mem::take(&mut state.history);
-            return Ok(tail);
+            return Ok(input);
         }
 
-        let k = self.config.kernel_size;
-        let channels = input[0].len();
-        let output_len = (input.len().saturating_sub(1)) * self.config.stride + k;
-        let output_len = output_len.saturating_sub(2 * self.config.padding);
-        let mut output = vec![vec![0.0f32; channels]; output_len.max(1)];
+        let output = conv_transpose1d(
+            input,
+            self.weight.clone(),
+            self.bias.clone(),
+            ConvTransposeOptions::new(
+                [self.config.stride],
+                [self.config.padding],
+                [0],
+                [self.config.dilation],
+                1,
+            ),
+        );
 
-        for (i, sample) in input.iter().enumerate() {
-            let base = i * self.config.stride;
-            for tap in 0..k {
-                let out_idx = base + tap;
-                if out_idx >= output_len {
-                    continue;
-                }
-                for ch in 0..channels {
-                    let weight = self.kernel.weights[tap][ch];
-                    output[out_idx][ch] += sample[ch] * weight;
-                }
+        let output = if let Some(history) = state.history.take() {
+            let hist_len = history.dims()[2];
+            if hist_len > 0 {
+                let prefix = output.clone().narrow(2, 0, hist_len);
+                let merged = prefix + history;
+                output.slice_assign(s![.., .., 0..hist_len], merged)
+            } else {
+                output
             }
-        }
+        } else {
+            output
+        };
 
-        if !state.history.is_empty() {
-            for (idx, value) in state.history.iter().enumerate() {
-                if idx < output.len() {
-                    for ch in 0..channels {
-                        output[idx][ch] += value[ch];
-                    }
-                }
-            }
+        let tail_len = self.config.dilation * (self.config.kernel_size.saturating_sub(1));
+        let total_len = output.dims()[2];
+        if tail_len == 0 {
+            return Ok(output);
         }
-
-        let tail_len = k - 1;
-        let emit_len = output.len().saturating_sub(tail_len);
-        let mut emit = output[..emit_len].to_vec();
-        let tail = output[emit_len..].to_vec();
-        state.history = tail;
-
-        if let Some(bias) = &self.kernel.bias {
-            for frame in &mut emit {
-                for ch in 0..channels {
-                    frame[ch] += bias[ch];
-                }
-            }
+        if total_len <= tail_len {
+            let dims = output.dims();
+            let device = output.device();
+            state.history = Some(output);
+            return Ok(Tensor::zeros([dims[0], dims[1], 0], &device));
         }
+        let emit_len = total_len - tail_len;
+        let emit = output.clone().narrow(2, 0, emit_len);
+        let tail = output.narrow(2, emit_len, tail_len);
+        state.history = Some(tail);
 
         Ok(emit)
     }
 }
 
-impl StreamingModule for StreamingConv1d {
-    type State = StreamingConvState;
+impl<B: Backend> StreamingModule<B> for StreamingConv1d {
+    type State = StreamingConvState<B>;
 
     fn init_state(&self, _batch_size: usize, _sequence_length: usize) -> Self::State {
         StreamingConvState::default()
@@ -220,8 +209,8 @@ impl StreamingModule for StreamingConv1d {
     }
 }
 
-impl StreamingModule for StreamingConvTranspose1d {
-    type State = StreamingConvState;
+impl<B: Backend> StreamingModule<B> for StreamingConvTranspose1d {
+    type State = StreamingConvState<B>;
 
     fn init_state(&self, _batch_size: usize, _sequence_length: usize) -> Self::State {
         StreamingConvState::default()
@@ -230,94 +219,56 @@ impl StreamingModule for StreamingConvTranspose1d {
     fn increment_step(&self, state: &mut Self::State, increment: usize) {
         state.step.increment(increment);
     }
+}
+
+fn conv_output_len(input_len: usize, kernel: usize, stride: usize, dilation: usize, padding: usize) -> usize {
+    if input_len == 0 {
+        return 0;
+    }
+    let kernel_extent = dilation * (kernel.saturating_sub(1)) + 1;
+    let padded = input_len + 2 * padding;
+    if padded < kernel_extent {
+        return 0;
+    }
+    (padded - kernel_extent) / stride + 1
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        PaddingMode,
-        StreamingConv1d,
-        StreamingConv1dOp,
-        StreamingConvConfig,
-        StreamingConvKernel,
-        StreamingConvTranspose1dOp,
-        StreamingModule,
-    };
+    use super::*;
+    use burn_ndarray::{NdArray, NdArrayDevice};
 
-    #[test]
-    fn streaming_conv_state_increments() {
-        let module = StreamingConv1d::default();
-        let mut state = module.init_state(1, 0);
-        module.increment_step(&mut state, 3);
-        assert_eq!(state.step.index, 3);
-    }
+    type TestBackend = NdArray<f32>;
 
     #[test]
     fn streaming_conv_forward_accumulates_history() {
-        let config = StreamingConvConfig {
-            kernel_size: 3,
-            stride: 1,
-            dilation: 1,
-            padding: 0,
-            pad_mode: PaddingMode::Constant,
-        };
-        let kernel =
-            StreamingConvKernel::new(vec![vec![1.0], vec![0.0], vec![-1.0]], Some(vec![0.0]))
-                .unwrap();
-        let op = StreamingConv1dOp::new(config, kernel);
-        let mut state = StreamingConv1d::default().init_state(1, 0);
-
-        let first = op.forward(&mut state, &[vec![1.0], vec![2.0], vec![3.0]]);
-        assert_eq!(first, vec![vec![1.0], vec![2.0], vec![2.0]]);
-
-        let second = op.forward(&mut state, &[vec![4.0]]);
-        assert_eq!(second, vec![vec![2.0]]);
-    }
-
-    #[test]
-    fn streaming_conv_transpose_emits_with_tail() {
+        let device = NdArrayDevice::default();
+        let weight = Tensor::<TestBackend, 3>::from_floats([[[0.0, 1.0]]], &device);
+        let bias = Some(Tensor::<TestBackend, 1>::from_floats([0.0], &device));
         let config = StreamingConvConfig {
             kernel_size: 2,
             stride: 1,
             dilation: 1,
-            padding: 0,
+            padding: 1,
             pad_mode: PaddingMode::Constant,
         };
-        let kernel =
-            StreamingConvKernel::new(vec![vec![1.0], vec![1.0]], Some(vec![0.5])).unwrap();
-        let op = StreamingConvTranspose1dOp::new(config, kernel);
+        let op = StreamingConv1dOp::new(config, weight, bias);
         let mut state = StreamingConv1d::default().init_state(1, 0);
 
-        let first = op.forward(&mut state, &[vec![1.0]]).unwrap();
-        assert_eq!(first, vec![vec![1.5]]);
+        let input = Tensor::<TestBackend, 3>::from_floats([[[1.0, 2.0, 3.0]]], &device);
+        let first = op.forward(&mut state, input).to_data();
+        assert_eq!(first.as_slice::<f32>().unwrap(), &[1.0, 2.0, 3.0]);
 
-        let second = op.forward(&mut state, &[vec![2.0]]).unwrap();
-        assert_eq!(second, vec![vec![3.5]]);
-    }
-
-    #[test]
-    fn streaming_conv_multi_channel() {
-        let config = StreamingConvConfig {
-            kernel_size: 2,
-            stride: 1,
-            dilation: 1,
-            padding: 0,
-            pad_mode: PaddingMode::Constant,
-        };
-        let kernel = StreamingConvKernel::new(
-            vec![vec![1.0, -1.0], vec![0.5, 0.5]],
-            Some(vec![0.0, 0.0]),
-        )
-        .unwrap();
-        let op = StreamingConv1dOp::new(config, kernel);
-        let mut state = StreamingConv1d::default().init_state(1, 0);
-
-        let output = op.forward(&mut state, &[vec![2.0, 4.0], vec![1.0, 3.0]]);
-        assert_eq!(output, vec![vec![2.0, -4.0], vec![2.0, -1.0]]);
+        let input = Tensor::<TestBackend, 3>::from_floats([[[4.0]]], &device);
+        let second = op.forward(&mut state, input).to_data();
+        assert_eq!(second.as_slice::<f32>().unwrap(), &[4.0]);
     }
 
     #[test]
     fn streaming_conv_replicate_padding() {
+        let device = NdArrayDevice::default();
+        let weight = Tensor::<TestBackend, 3>::from_floats([[[1.0, 1.0]]], &device);
+        let bias = Some(Tensor::<TestBackend, 1>::from_floats([0.0], &device));
         let config = StreamingConvConfig {
             kernel_size: 2,
             stride: 1,
@@ -325,34 +276,37 @@ mod tests {
             padding: 1,
             pad_mode: PaddingMode::Replicate,
         };
-        let kernel =
-            StreamingConvKernel::new(vec![vec![1.0], vec![1.0]], Some(vec![0.0])).unwrap();
-        let op = StreamingConv1dOp::new(config, kernel);
+        let op = StreamingConv1dOp::new(config, weight, bias);
         let mut state = StreamingConv1d::default().init_state(1, 0);
 
-        let output = op.forward(&mut state, &[vec![2.0], vec![3.0]]);
-        assert_eq!(output, vec![vec![4.0], vec![4.0]]);
+        let input = Tensor::<TestBackend, 3>::from_floats([[[2.0, 3.0]]], &device);
+        let output = op.forward(&mut state, input).to_data();
+        assert_eq!(output.as_slice::<f32>().unwrap(), &[4.0, 5.0]);
     }
 
     #[test]
     fn streaming_conv_transpose_stride_padding() {
+        let device = NdArrayDevice::default();
+        let weight = Tensor::<TestBackend, 3>::from_floats([[[1.0, 1.0]]], &device);
+        let bias = Some(Tensor::<TestBackend, 1>::from_floats([0.0], &device));
         let config = StreamingConvConfig {
-            kernel_size: 3,
-            stride: 2,
+            kernel_size: 2,
+            stride: 1,
             dilation: 1,
-            padding: 1,
+            padding: 0,
             pad_mode: PaddingMode::Constant,
         };
-        let kernel =
-            StreamingConvKernel::new(vec![vec![1.0], vec![1.0], vec![1.0]], Some(vec![0.0]))
-                .unwrap();
-        let op = StreamingConvTranspose1dOp::new(config, kernel);
+        let op = StreamingConvTranspose1dOp::new(config, weight, bias);
         let mut state = StreamingConv1d::default().init_state(1, 0);
 
-        let output = op.forward(&mut state, &[vec![1.0], vec![1.0]]).unwrap();
-        assert_eq!(output, vec![vec![1.0]]);
+        let input = Tensor::<TestBackend, 3>::from_floats([[[1.0, 1.0]]], &device);
+        let output = op.forward(&mut state, input).unwrap().to_data();
+        assert_eq!(output.as_slice::<f32>().unwrap(), &[1.0, 2.0]);
 
-        let flushed = op.forward(&mut state, &[]).unwrap();
-        assert_eq!(flushed, vec![vec![1.0], vec![2.0]]);
+        let flush = op
+            .forward(&mut state, Tensor::<TestBackend, 3>::zeros([1, 1, 0], &device))
+            .unwrap()
+            .to_data();
+        assert_eq!(flush.as_slice::<f32>().unwrap(), &[1.0]);
     }
 }

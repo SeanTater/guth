@@ -1,3 +1,4 @@
+use burn::tensor::backend::Backend;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -21,7 +22,7 @@ impl Default for StreamStep {
     }
 }
 
-pub trait StreamingModule {
+pub trait StreamingModule<B: Backend> {
     type State;
 
     fn init_state(&self, batch_size: usize, sequence_length: usize) -> Self::State;

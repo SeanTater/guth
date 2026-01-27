@@ -30,3 +30,4 @@ tracing = "0.1"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+burn-ndarray = "0.20.1"
