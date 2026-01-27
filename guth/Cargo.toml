@@ -1,0 +1,31 @@
+[package]
+name = "guth"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "guth"
+path = "src/lib.rs"
+
+[[bin]]
+name = "guth"
+path = "src/main.rs"
+
+[dependencies]
+burn = { version = "0.20.1", features = ["ndarray"] }
+burn-nn = "0.20.1"
+safetensors = "0.4"
+hf-hub = "0.3"
+sentencepiece = "0.13.1"
+hound = "3.5"
+rubato = "0.15"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+rand = "0.8"
+anyhow = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1"

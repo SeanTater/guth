@@ -69,6 +69,8 @@ dataset/*
 Cargo.toml
 Cargo.lock
 target/
+!guth/Cargo.toml
+!guth/Cargo.lock
 
 # nfs files
 .nfs*
@@ -86,3 +88,6 @@ profile_output*
 CLAUDE.md
 QWEN.md
 .claude/
+
+# Plans
+/.plans/
