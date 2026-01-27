@@ -104,9 +104,13 @@ impl<B: Backend> StreamingMhaOp<B> {
         let ds = Tensor::<B, 1, Int>::arange(0..half as i64, &device).float();
         let freqs = ds.mul_scalar(scale).exp();
 
-        let ts = Tensor::<B, 1, Int>::arange(0..seq as i64, &device)
+        let mut ts = Tensor::<B, 1, Int>::arange(0..seq as i64, &device)
             .float()
             .add_scalar(start as f32);
+        if let Some(max_seq) = self.config.rope_max_seq {
+            let max = max_seq.saturating_sub(1) as f32;
+            ts = ts.clamp(0.0, max);
+        }
         let angles = ts.unsqueeze_dim::<2>(1).mul(freqs.unsqueeze_dim::<2>(0));
         let rotr = angles.clone().cos();
         let roti = angles.sin();

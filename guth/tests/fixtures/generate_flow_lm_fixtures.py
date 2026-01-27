@@ -57,6 +57,7 @@ def load_flow_net_weights(flow_net: SimpleMLPAdaLN, fixture: dict[str, Any]):
 
 
 def main() -> None:
+    # Regenerate with: uv run --with torch guth/tests/fixtures/generate_flow_lm_fixtures.py
     torch.manual_seed(7)
 
     # Use flow net fixture weights to align with existing Rust flow_net tests.

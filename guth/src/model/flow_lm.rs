@@ -3,7 +3,7 @@ use crate::modules::flow_net::{lsd_decode, SimpleMlpAdaLn};
 use crate::modules::transformer::{StreamingTransformer, StreamingTransformerState};
 use crate::state::StreamingModule;
 use burn::tensor::backend::Backend;
-use burn::tensor::{Bool, Distribution, Tensor};
+use burn::tensor::{Bool, Distribution, ElementConversion, Tensor};
 use burn_nn::{LayerNorm, Linear};
 
 #[derive(Debug)]
@@ -161,9 +161,53 @@ fn make_noise<B: Backend>(
         return Tensor::<B, 2>::zeros(shape, device);
     }
     let std = (temp as f64).sqrt();
-    let mut noise = Tensor::<B, 2>::random(shape, Distribution::Normal(0.0, std), device);
     if let Some(clamp) = noise_clamp {
+        return truncated_normal(shape, std, clamp, device);
+    }
+    Tensor::<B, 2>::random(shape, Distribution::Normal(0.0, std), device)
+}
+
+fn truncated_normal<B: Backend>(
+    shape: [usize; 2],
+    std: f64,
+    clamp: f32,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let mut noise = Tensor::<B, 2>::random(shape, Distribution::Normal(0.0, std), device);
+    let mut mask = out_of_bounds(noise.clone(), clamp);
+    let mut remaining: bool = mask.clone().any().into_scalar().elem();
+    let mut attempts = 0;
+    while remaining && attempts < 10 {
+        let resample = Tensor::<B, 2>::random(shape, Distribution::Normal(0.0, std), device);
+        noise = noise.mask_where(mask, resample);
+        mask = out_of_bounds(noise.clone(), clamp);
+        remaining = mask.clone().any().into_scalar().elem();
+        attempts += 1;
+    }
+    if remaining {
         noise = noise.clamp(-clamp, clamp);
     }
     noise
+}
+
+fn out_of_bounds<B: Backend>(noise: Tensor<B, 2>, clamp: f32) -> Tensor<B, 2, Bool> {
+    noise
+        .clone()
+        .lower_elem(-clamp)
+        .bool_or(noise.greater_elem(clamp))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::make_noise;
+    use burn_ndarray::{NdArray, NdArrayDevice};
+
+    #[test]
+    fn truncated_noise_respects_clamp() {
+        let device = NdArrayDevice::default();
+        let noise = make_noise::<NdArray<f32>>([8, 8], 1.0, Some(0.5), &device);
+        let data = noise.to_data();
+        let values = data.as_slice::<f32>().expect("noise values");
+        assert!(values.iter().all(|v| v.abs() <= 0.5 + 1e-6));
+    }
 }
