@@ -113,7 +113,8 @@ impl<B: Backend> StreamingConv1dOp<B> {
             output.narrow(2, out_hist, out_new_len)
         };
 
-        let history_keep = self.config.dilation * (self.config.kernel_size.saturating_sub(1));
+        let effective_kernel = self.config.dilation * (self.config.kernel_size.saturating_sub(1)) + 1;
+        let history_keep = effective_kernel.saturating_sub(self.config.stride);
         if history_keep > 0 {
             let extended_len = extended.dims()[2];
             let start = extended_len.saturating_sub(history_keep);
@@ -177,7 +178,7 @@ impl<B: Backend> StreamingConvTranspose1dOp<B> {
             output
         };
 
-        let tail_len = self.config.dilation * (self.config.kernel_size.saturating_sub(1));
+        let tail_len = self.config.kernel_size.saturating_sub(self.config.stride);
         let total_len = output.dims()[2];
         if tail_len == 0 {
             return Ok(output);

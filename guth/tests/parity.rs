@@ -3,7 +3,7 @@ use burn_ndarray::{NdArray, NdArrayDevice};
 use serde::Deserialize;
 
 use guth::modules::streaming_conv::{
-    PaddingMode, StreamingConv1d, StreamingConv1dOp, StreamingConvConfig,
+    PaddingMode, StreamingConv1dOp, StreamingConvConfig, StreamingConvState,
     StreamingConvTranspose1dOp,
 };
 use guth::modules::streaming_mha::{StreamingMha, StreamingMhaConfig, StreamingMhaOp};
@@ -123,6 +123,39 @@ fn tensor4_from_nested(data: Vec<Vec<Vec<Vec<f32>>>>, device: &NdArrayDevice) ->
     Tensor::from_data(td, device)
 }
 
+fn init_conv_state(
+    config: &StreamingConvConfig,
+    weight: &Tensor<TestBackend, 3>,
+    device: &NdArrayDevice,
+) -> StreamingConvState<TestBackend> {
+    let effective_kernel = config.dilation * (config.kernel_size.saturating_sub(1)) + 1;
+    let history_len = effective_kernel.saturating_sub(config.stride);
+    let mut state = StreamingConvState::default();
+    if history_len == 0 {
+        return state;
+    }
+    let in_channels = weight.dims()[1];
+    let history = Tensor::zeros([1, in_channels, history_len], device);
+    state.history = Some(history);
+    state
+}
+
+fn init_conv_transpose_state(
+    config: &StreamingConvConfig,
+    weight: &Tensor<TestBackend, 3>,
+    device: &NdArrayDevice,
+) -> StreamingConvState<TestBackend> {
+    let history_len = config.kernel_size.saturating_sub(config.stride);
+    let mut state = StreamingConvState::default();
+    if history_len == 0 {
+        return state;
+    }
+    let out_channels = weight.dims()[1];
+    let history = Tensor::zeros([1, out_channels, history_len], device);
+    state.history = Some(history);
+    state
+}
+
 #[test]
 fn parity_conv1d_streaming() {
     let device = NdArrayDevice::default();
@@ -141,7 +174,7 @@ fn parity_conv1d_streaming() {
     let weight = tensor3_from_nested(fixture.weight, &device);
     let bias = tensor1_from_vec(fixture.bias, &device);
     let op = StreamingConv1dOp::new(config, weight, Some(bias));
-    let mut state = StreamingConv1d::default().init_state(1, 0);
+    let mut state = init_conv_state(&op.config, &op.weight, &device);
 
     for (chunk, expected) in fixture.chunks.into_iter().zip(fixture.outputs.into_iter()) {
         let input = tensor3_from_nested(chunk, &device);
@@ -165,7 +198,7 @@ fn parity_conv_transpose_streaming() {
     let weight = tensor3_from_nested(fixture.weight, &device);
     let bias = tensor1_from_vec(fixture.bias, &device);
     let op = StreamingConvTranspose1dOp::new(config, weight, Some(bias));
-    let mut state = StreamingConv1d::default().init_state(1, 0);
+    let mut state = init_conv_transpose_state(&op.config, &op.weight, &device);
 
     let input = tensor3_from_nested(fixture.chunk, &device);
     let output = op.forward(&mut state, input).unwrap().to_data();
