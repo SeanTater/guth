@@ -1,2 +1,48 @@
+use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+pub struct StreamStep {
+    pub index: usize,
+}
+
+impl StreamStep {
+    pub fn new() -> Self {
+        Self { index: 0 }
+    }
+
+    pub fn increment(&mut self, by: usize) {
+        self.index = self.index.saturating_add(by);
+    }
+}
+
+impl Default for StreamStep {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub trait StreamingModule {
+    type State;
+
+    fn init_state(&self, batch_size: usize, sequence_length: usize) -> Self::State;
+    fn increment_step(&self, state: &mut Self::State, increment: usize);
+}
+
 #[derive(Debug, Default)]
-pub struct StreamingState;
+pub struct StateTree {
+    steps: HashMap<String, StreamStep>,
+}
+
+impl StateTree {
+    pub fn set_step(&mut self, key: impl Into<String>, step: StreamStep) {
+        self.steps.insert(key.into(), step);
+    }
+
+    pub fn step_mut(&mut self, key: &str) -> Option<&mut StreamStep> {
+        self.steps.get_mut(key)
+    }
+
+    pub fn step(&self, key: &str) -> Option<&StreamStep> {
+        self.steps.get(key)
+    }
+}
