@@ -183,22 +183,24 @@ fn parity_conv_transpose_streaming() {
 #[test]
 fn parity_attention() {
     let device = NdArrayDevice::default();
-    let fixture: AttentionFixture = read_fixture("attention.json");
-    let config = StreamingMhaConfig {
-        num_heads: fixture.config.num_heads,
-        head_dim: fixture.config.head_dim,
-        causal: fixture.config.causal,
-        ..Default::default()
-    };
-    let op = StreamingMhaOp::<TestBackend>::new(config, &device);
-    let mut state = StreamingMha::default().init_state(1, 0);
+    for fixture_name in ["attention.json", "attention_causal.json", "attention_multihead.json"] {
+        let fixture: AttentionFixture = read_fixture(fixture_name);
+        let config = StreamingMhaConfig {
+            num_heads: fixture.config.num_heads,
+            head_dim: fixture.config.head_dim,
+            causal: fixture.config.causal,
+            ..Default::default()
+        };
+        let op = StreamingMhaOp::<TestBackend>::new(config, &device);
+        let mut state = StreamingMha::default().init_state(1, 0);
 
-    let keys = tensor4_from_nested(fixture.keys, &device);
-    let values = tensor4_from_nested(fixture.values, &device);
-    op.append_kv(&mut state, keys, values);
+        let keys = tensor4_from_nested(fixture.keys, &device);
+        let values = tensor4_from_nested(fixture.values, &device);
+        op.append_kv(&mut state, keys, values);
 
-    let queries = tensor4_from_nested(fixture.queries, &device);
-    let output = op.attention(&state, queries).to_data();
-    let expected = tensor4_from_nested(fixture.output, &device).to_data();
-    assert_close(&output, &expected, 1e-4);
+        let queries = tensor4_from_nested(fixture.queries, &device);
+        let output = op.attention(&state, queries).to_data();
+        let expected = tensor4_from_nested(fixture.output, &device).to_data();
+        assert_close(&output, &expected, 1e-4);
+    }
 }

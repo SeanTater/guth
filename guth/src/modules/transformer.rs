@@ -295,8 +295,12 @@ impl<B: Backend> StreamingModule<B> for ProjectedTransformer<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::module::Param;
     use burn::tensor::TensorData;
     use burn_ndarray::{NdArray, NdArrayDevice};
+    use serde::Deserialize;
+    use std::fs;
+    use std::path::PathBuf;
 
     type TestBackend = NdArray<f32>;
 
@@ -324,6 +328,82 @@ mod tests {
             .zip(b_values.iter())
             .map(|(x, y)| (x - y).abs())
             .fold(0.0_f32, |acc, v| acc.max(v))
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct TransformerFixture {
+        config: TransformerFixtureConfig,
+        weights: TransformerWeights,
+        input: Vec<Vec<Vec<f32>>>,
+        output: Vec<Vec<Vec<f32>>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct TransformerFixtureConfig {
+        d_model: usize,
+        num_heads: usize,
+        ffn_dim: usize,
+        causal: bool,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct TransformerWeights {
+        norm1: NormWeights,
+        norm2: NormWeights,
+        qkv: LinearWeights,
+        out_proj: LinearWeights,
+        ffn_in: LinearWeights,
+        ffn_out: LinearWeights,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LinearWeights {
+        weight: Vec<Vec<f32>>,
+        bias: Vec<f32>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct NormWeights {
+        gamma: Vec<f32>,
+        beta: Vec<f32>,
+    }
+
+    fn fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    fn load_fixture(name: &str) -> TransformerFixture {
+        let data = fs::read_to_string(fixture_path(name)).expect("fixture read");
+        serde_json::from_str(&data).expect("fixture parse")
+    }
+
+    fn tensor3(device: &NdArrayDevice, data: Vec<Vec<Vec<f32>>>) -> Tensor<TestBackend, 3> {
+        let b = data.len();
+        let t = data[0].len();
+        let d = data[0][0].len();
+        let flat: Vec<f32> = data.into_iter().flatten().flatten().collect();
+        let td = TensorData::new(flat, [b, t, d]);
+        Tensor::from_data(td, device)
+    }
+
+    fn apply_linear(linear: &mut Linear<TestBackend>, weights: &LinearWeights, device: &NdArrayDevice) {
+        let rows = weights.weight.len();
+        let cols = weights.weight.first().map(|row| row.len()).unwrap_or(0);
+        let flat: Vec<f32> = weights.weight.clone().into_iter().flatten().collect();
+        let weight = Tensor::from_data(TensorData::new(flat, [rows, cols]), device);
+        linear.weight = Param::from_tensor(weight);
+        let bias = Tensor::from_data(TensorData::new(weights.bias.clone(), [weights.bias.len()]), device);
+        linear.bias = Some(Param::from_tensor(bias));
+    }
+
+    fn apply_norm(norm: &mut LayerNorm<TestBackend>, weights: &NormWeights, device: &NdArrayDevice) {
+        let gamma = Tensor::from_data(TensorData::new(weights.gamma.clone(), [weights.gamma.len()]), device);
+        let beta = Tensor::from_data(TensorData::new(weights.beta.clone(), [weights.beta.len()]), device);
+        norm.gamma = Param::from_tensor(gamma);
+        norm.beta = Some(Param::from_tensor(beta));
     }
 
     #[test]
@@ -423,5 +503,32 @@ mod tests {
 
         let diff = max_abs_diff(batch_output.swap_dims(1, 2), stream_output.swap_dims(1, 2));
         assert!(diff < 1e-4, "max diff {diff}");
+    }
+
+    #[test]
+    fn transformer_layer_matches_fixture() {
+        let device = NdArrayDevice::default();
+        let fixture = load_fixture("transformer_layer.json");
+        let config = StreamingTransformerLayerConfig {
+            d_model: fixture.config.d_model,
+            num_heads: fixture.config.num_heads,
+            ffn_dim: fixture.config.ffn_dim,
+            causal: fixture.config.causal,
+            ..Default::default()
+        };
+        let mut layer = StreamingTransformerLayer::<TestBackend>::new(config, &device);
+
+        apply_norm(&mut layer.norm1, &fixture.weights.norm1, &device);
+        apply_norm(&mut layer.norm2, &fixture.weights.norm2, &device);
+        apply_linear(&mut layer.qkv, &fixture.weights.qkv, &device);
+        apply_linear(&mut layer.out_proj, &fixture.weights.out_proj, &device);
+        apply_linear(&mut layer.ffn_in, &fixture.weights.ffn_in, &device);
+        apply_linear(&mut layer.ffn_out, &fixture.weights.ffn_out, &device);
+
+        let input = tensor3(&device, fixture.input);
+        let expected = tensor3(&device, fixture.output).to_data();
+        let mut state = layer.init_state(1, input.dims()[1]);
+        let output = layer.forward(input, &mut state).to_data();
+        output.assert_approx_eq(&expected, burn::tensor::Tolerance::<f32>::absolute(1e-4));
     }
 }
