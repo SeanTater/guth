@@ -183,7 +183,7 @@ fn tensor2_from_state_data(
     Tensor::from_data(TensorData::new(values, shape), device)
 }
 
-fn build_flow_net(device: &NdArrayDevice, fixture: FlowNetFixture) -> SimpleMlpAdaLn<TestBackend> {
+fn build_flow_net(device: &NdArrayDevice, fixture: &FlowNetFixture) -> SimpleMlpAdaLn<TestBackend> {
     let mut config = SimpleMlpAdaLnConfig::new(
         fixture.config.in_channels,
         fixture.config.model_channels,
@@ -314,16 +314,12 @@ fn build_projected_transformer(
     MimiProjectedTransformer::<TestBackend>::new(projected_config, device)
 }
 
-#[test]
-fn tts_model_matches_fixture() {
-    let device = NdArrayDevice::default();
-    let fixture: TtsFixture = read_fixture("tts_model.json");
-
+fn build_tts_model(fixture: &TtsFixture, device: &NdArrayDevice) -> TtsModel<TestBackend> {
     let embed = burn_nn::EmbeddingConfig::new(
         fixture.conditioner.n_bins,
         fixture.config.dim,
     )
-    .init::<TestBackend>(&device);
+    .init::<TestBackend>(device);
     let conditioner = LutConditioner {
         tokenizer: None,
         embed,
@@ -344,22 +340,21 @@ fn tts_model_matches_fixture() {
             layer_scale: None,
         },
     };
-    let transformer = StreamingTransformer::<TestBackend>::new(transformer_config, &device);
+    let transformer = StreamingTransformer::<TestBackend>::new(transformer_config, device);
 
-    let flow_net = build_flow_net(&device, fixture.flow_net);
+    let flow_net = build_flow_net(device, &fixture.flow_net);
 
     let input_linear = burn_nn::LinearConfig::new(fixture.config.ldim, fixture.config.dim)
         .with_bias(false)
-        .init::<TestBackend>(&device);
+        .init::<TestBackend>(device);
 
     let out_norm = burn_nn::LayerNormConfig::new(fixture.config.dim)
-        .init::<TestBackend>(&device);
-
+        .init::<TestBackend>(device);
     let out_eos = burn_nn::LinearConfig::new(fixture.config.dim, 1)
-        .init::<TestBackend>(&device);
-    let emb_mean = Tensor::<TestBackend, 1>::zeros([fixture.config.ldim], &device);
-    let emb_std = Tensor::<TestBackend, 1>::zeros([fixture.config.ldim], &device);
-    let bos_emb = Tensor::<TestBackend, 1>::zeros([fixture.config.ldim], &device);
+        .init::<TestBackend>(device);
+    let emb_mean = Tensor::<TestBackend, 1>::zeros([fixture.config.ldim], device);
+    let emb_std = Tensor::<TestBackend, 1>::zeros([fixture.config.ldim], device);
+    let bos_emb = Tensor::<TestBackend, 1>::zeros([fixture.config.ldim], device);
 
     let mut flow_lm = FlowLmModel::new(
         conditioner,
@@ -377,16 +372,16 @@ fn tts_model_matches_fixture() {
     let flow_state = load_flow_lm_state_dict("tests/fixtures/tts_flow_lm_state.safetensors")
         .expect("load flow lm state dict");
     flow_lm
-        .load_state_dict(&flow_state, &device)
+        .load_state_dict(&flow_state, device)
         .expect("apply flow lm state dict");
 
-    let encoder = build_seanet_encoder(&device);
-    let decoder = build_seanet_decoder(&device);
+    let encoder = build_seanet_encoder(device);
+    let decoder = build_seanet_decoder(device);
     let encoder_transformer =
-        build_projected_transformer(&fixture.mimi_config.transformer, &device);
+        build_projected_transformer(&fixture.mimi_config.transformer, device);
     let decoder_transformer =
-        build_projected_transformer(&fixture.mimi_config.transformer, &device);
-    let quantizer_weight = Tensor::<TestBackend, 3>::zeros([1, 1, 1], &device);
+        build_projected_transformer(&fixture.mimi_config.transformer, device);
+    let quantizer_weight = Tensor::<TestBackend, 3>::zeros([1, 1, 1], device);
     let quantizer = DummyQuantizer::new(quantizer_weight);
 
     let mut mimi = MimiModel::new(
@@ -406,14 +401,14 @@ fn tts_model_matches_fixture() {
     let mimi_state = load_mimi_state_dict("tests/fixtures/tts_mimi_state.safetensors")
         .expect("load mimi state dict");
     mimi
-        .load_state_dict(&mimi_state, &device)
+        .load_state_dict(&mimi_state, device)
         .expect("apply mimi state dict");
 
     let speaker_proj_data = flow_state
         .get("speaker_proj_weight")
         .expect("speaker proj weight");
-    let speaker_proj_weight = tensor2_from_state_data(speaker_proj_data, &device);
-    let tts = TtsModel::new(
+    let speaker_proj_weight = tensor2_from_state_data(speaker_proj_data, device);
+    TtsModel::new(
         flow_lm,
         mimi,
         speaker_proj_weight,
@@ -421,7 +416,14 @@ fn tts_model_matches_fixture() {
         fixture.generation.lsd_decode_steps,
         fixture.generation.noise_clamp,
         fixture.generation.eos_threshold,
-    );
+    )
+}
+
+#[test]
+fn tts_model_matches_fixture() {
+    let device = NdArrayDevice::default();
+    let fixture: TtsFixture = read_fixture("tts_model.json");
+    let tts = build_tts_model(&fixture, &device);
 
     let tokens = tensor2_int(&device, fixture.conditioner.tokens);
     let flow_len = tokens.dims()[1] + fixture.generation.max_gen_len + 1;
@@ -445,6 +447,41 @@ fn tts_model_matches_fixture() {
 
     audio.to_data().assert_approx_eq(
         &tensor3(&device, fixture.audio_full).to_data(),
+        Tolerance::<f32>::absolute(1e-4).set_relative(1e-4),
+    );
+}
+
+#[test]
+fn tts_streaming_matches_batch() {
+    let device = NdArrayDevice::default();
+    let fixture: TtsFixture = read_fixture("tts_model.json");
+
+    let batch_tts = build_tts_model(&fixture, &device);
+    let tokens = tensor2_int(&device, fixture.conditioner.tokens.clone());
+    let flow_len = tokens.dims()[1] + fixture.generation.max_gen_len + 1;
+    let mut batch_state = batch_tts.init_state(1, flow_len, fixture.generation.max_gen_len, &device);
+    let (_latents, _eos, batch_audio) = batch_tts.generate_audio_from_tokens(
+        tokens,
+        &mut batch_state,
+        fixture.generation.max_gen_len,
+        fixture.generation.frames_after_eos,
+    );
+
+    let stream_tts = build_tts_model(&fixture, &device);
+    let tokens = tensor2_int(&device, fixture.conditioner.tokens);
+    let receiver = stream_tts.generate_audio_stream(
+        tokens,
+        fixture.generation.max_gen_len,
+        fixture.generation.frames_after_eos,
+    );
+    let mut chunks = Vec::new();
+    for chunk in receiver {
+        chunks.push(chunk);
+    }
+    let stream_audio = Tensor::cat(chunks, 2);
+
+    stream_audio.to_data().assert_approx_eq(
+        &batch_audio.to_data(),
         Tolerance::<f32>::absolute(1e-4).set_relative(1e-4),
     );
 }
