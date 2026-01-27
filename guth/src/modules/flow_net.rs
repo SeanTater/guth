@@ -423,6 +423,14 @@ mod tests {
         expected: FlowNetExpected,
     }
 
+    #[derive(Debug, Deserialize)]
+    struct RmsNormFixture {
+        eps: f32,
+        input: Vec<Vec<f32>>,
+        gamma: Vec<f32>,
+        output: Vec<Vec<f32>>,
+    }
+
     fn fixture_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -433,6 +441,15 @@ mod tests {
     fn load_fixture() -> FlowNetFixture {
         let data = fs::read_to_string(fixture_path()).expect("fixture missing");
         serde_json::from_str(&data).expect("fixture parse")
+    }
+
+    fn load_rmsnorm_fixture() -> RmsNormFixture {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("rmsnorm.json");
+        let data = fs::read_to_string(path).expect("rmsnorm fixture read");
+        serde_json::from_str(&data).expect("rmsnorm fixture parse")
     }
 
     fn tensor2(device: &NdArrayDevice, data: Vec<Vec<f32>>) -> Tensor<TestBackend, 2> {
@@ -591,5 +608,29 @@ mod tests {
                 &expected.to_data(),
                 Tolerance::<f32>::absolute(1e-4).set_relative(1e-4),
             );
+    }
+
+    #[test]
+    fn rmsnorm_matches_fixture() {
+        let fixture = load_rmsnorm_fixture();
+        let device = NdArrayDevice::default();
+
+        let mut norm = RmsNormConfig::new(fixture.gamma.len())
+            .with_epsilon(fixture.eps)
+            .init::<TestBackend>(&device);
+
+        let gamma = Tensor::from_data(
+            TensorData::new(fixture.gamma.clone(), [fixture.gamma.len()]),
+            &device,
+        );
+        norm.gamma = Param::from_tensor(gamma);
+
+        let input = tensor2(&device, fixture.input);
+        let expected = tensor2(&device, fixture.output).to_data();
+        let output = norm.forward(input).to_data();
+        output.assert_approx_eq(
+            &expected,
+            Tolerance::<f32>::absolute(1e-4).set_relative(1e-4),
+        );
     }
 }
