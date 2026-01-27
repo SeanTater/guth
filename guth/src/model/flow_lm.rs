@@ -84,7 +84,12 @@ impl<B: Backend> FlowLmModel<B> {
 
         let input_ = apply_linear_3d(&self.input_linear, sequence.clone());
         let transformer_out = self.backbone(input_, text_embeddings, seq_len, &mut state.transformer);
-        let last = transformer_out.narrow(1, seq_len - 1, 1).reshape([batch, self.dim]);
+        let last_index = if seq_len == 0 {
+            transformer_out.dims()[1].saturating_sub(1)
+        } else {
+            seq_len - 1
+        };
+        let last = transformer_out.narrow(1, last_index, 1).reshape([batch, self.dim]);
         let eos_logits = self.out_eos.forward(last.clone());
         let eos = eos_logits.greater_elem(eos_threshold);
 
@@ -131,6 +136,9 @@ impl<B: Backend> FlowLmModel<B> {
         let combined = Tensor::cat(vec![text_embeddings, input], 1);
         let mut output = self.transformer.forward(combined, state);
         output = apply_layer_norm_3d(&self.out_norm, output);
+        if sequence_len == 0 {
+            return output;
+        }
         let total_len = output.dims()[1];
         output.narrow(1, total_len - sequence_len, sequence_len)
     }
@@ -138,6 +146,9 @@ impl<B: Backend> FlowLmModel<B> {
 
 fn apply_linear_3d<B: Backend>(linear: &Linear<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
     let [batch, seq, dim] = input.dims();
+    if seq == 0 {
+        return input;
+    }
     let flat = input.reshape([batch * seq, dim]);
     let output = linear.forward(flat);
     let out_dim = output.dims()[1];
@@ -146,6 +157,9 @@ fn apply_linear_3d<B: Backend>(linear: &Linear<B>, input: Tensor<B, 3>) -> Tenso
 
 fn apply_layer_norm_3d<B: Backend>(norm: &LayerNorm<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
     let [batch, seq, dim] = input.dims();
+    if seq == 0 {
+        return input;
+    }
     let flat = input.reshape([batch * seq, dim]);
     let output = norm.forward(flat);
     output.reshape([batch, seq, dim])
