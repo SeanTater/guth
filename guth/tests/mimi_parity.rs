@@ -478,6 +478,59 @@ fn mimi_streaming_decode_matches_batch() {
 }
 
 #[test]
+fn mimi_streaming_decode_unaligned_chunks_matches_batch() {
+    let device = NdArrayDevice::default();
+    let fixture: MimiFixture = read_fixture("mimi_model.json");
+
+    let encoder = build_seanet_encoder(&device);
+    let decoder = build_seanet_decoder(&device);
+    let encoder_transformer =
+        build_projected_transformer(&fixture.encoder_transformer, &fixture.config.transformer, &device);
+    let decoder_transformer =
+        build_projected_transformer(&fixture.decoder_transformer, &fixture.config.transformer, &device);
+    let quantizer_weight = Tensor::<TestBackend, 3>::zeros([1, 1, 1], &device);
+    let quantizer = DummyQuantizer::new(quantizer_weight);
+
+    let mimi = MimiModel::new(
+        encoder,
+        decoder,
+        encoder_transformer,
+        decoder_transformer,
+        quantizer,
+        fixture.config.frame_rate,
+        fixture.config.encoder_frame_rate,
+        fixture.config.sample_rate,
+        fixture.config.channels,
+        fixture.config.dimension,
+        None,
+        None,
+    );
+
+    let latent_input = tensor3_from_nested(fixture.latent_input, &device);
+    let mut batch_state = mimi.init_state(1, latent_input.dims()[2], &device);
+    let batch_audio = mimi.decode_from_latent(latent_input.clone(), &mut batch_state);
+
+    let mut stream_state = mimi.init_state(1, latent_input.dims()[2], &device);
+    let first_len = 1;
+    let chunk1 = latent_input.clone().narrow(2, 0, first_len);
+    let chunk2 = latent_input
+        .clone()
+        .narrow(2, first_len, latent_input.dims()[2] - first_len);
+    let out1 = mimi.decode_from_latent(chunk1, &mut stream_state);
+    mimi.increment_step(&mut stream_state, first_len);
+    let out2 = mimi.decode_from_latent(chunk2, &mut stream_state);
+    let stream_audio = Tensor::cat(vec![out1, out2], 2);
+
+    let diff = batch_audio.sub(stream_audio).abs().to_data();
+    let diff_values = diff.as_slice::<f32>().expect("diff slice");
+    let max_diff = diff_values
+        .iter()
+        .copied()
+        .fold(0.0_f32, |acc, val| acc.max(val));
+    assert!(max_diff < 1e-4, "max diff {max_diff}");
+}
+
+#[test]
 fn mimi_transformer_streaming_matches_batch() {
     let device = NdArrayDevice::default();
     let fixture: MimiFixture = read_fixture("mimi_model.json");
