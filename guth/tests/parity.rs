@@ -170,6 +170,7 @@ fn parity_conv1d_streaming() {
         dilation: fixture.config.dilation,
         padding: fixture.config.padding,
         pad_mode,
+        groups: 1,
     };
     let weight = tensor3_from_nested(fixture.weight, &device);
     let bias = tensor1_from_vec(fixture.bias, &device);
@@ -194,6 +195,7 @@ fn parity_conv_transpose_streaming() {
         dilation: fixture.config.dilation,
         padding: fixture.config.padding,
         pad_mode: PaddingMode::Constant,
+        groups: 1,
     };
     let weight = tensor3_from_nested(fixture.weight, &device);
     let bias = tensor1_from_vec(fixture.bias, &device);

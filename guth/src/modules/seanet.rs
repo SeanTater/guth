@@ -308,6 +308,7 @@ mod tests {
             dilation: fixture.config.dilation,
             padding: fixture.config.padding,
             pad_mode: pad_mode(&fixture.config.pad_mode),
+            groups: 1,
         };
         let weight = tensor3(device, fixture.weight.clone());
         let bias = if fixture.bias.is_empty() {
@@ -330,6 +331,7 @@ mod tests {
             dilation: fixture.dilation,
             padding: fixture.padding,
             pad_mode: PaddingMode::Constant,
+            groups: 1,
         };
         let weight = tensor3(device, weight);
         let bias = if bias.is_empty() {

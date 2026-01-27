@@ -39,6 +39,7 @@ pub struct StreamingConvConfig {
     pub dilation: usize,
     pub padding: usize,
     pub pad_mode: PaddingMode,
+    pub groups: usize,
 }
 
 impl Default for StreamingConvConfig {
@@ -49,6 +50,7 @@ impl Default for StreamingConvConfig {
             dilation: 1,
             padding: 0,
             pad_mode: PaddingMode::Constant,
+            groups: 1,
         }
     }
 }
@@ -94,7 +96,12 @@ impl<B: Backend> StreamingConv1dOp<B> {
             extended.clone(),
             self.weight.clone(),
             self.bias.clone(),
-            ConvOptions::new([self.config.stride], [0], [self.config.dilation], 1),
+            ConvOptions::new(
+                [self.config.stride],
+                [0],
+                [self.config.dilation],
+                self.config.groups,
+            ),
         );
 
         let out_hist = conv_output_len(
@@ -161,7 +168,7 @@ impl<B: Backend> StreamingConvTranspose1dOp<B> {
                 [self.config.padding],
                 [0],
                 [self.config.dilation],
-                1,
+                self.config.groups,
             ),
         );
 
@@ -252,6 +259,7 @@ mod tests {
             dilation: 1,
             padding: 1,
             pad_mode: PaddingMode::Constant,
+            groups: 1,
         };
         let op = StreamingConv1dOp::new(config, weight, bias);
         let mut state = StreamingConv1d::default().init_state(1, 0);
@@ -276,6 +284,7 @@ mod tests {
             dilation: 1,
             padding: 1,
             pad_mode: PaddingMode::Replicate,
+            groups: 1,
         };
         let op = StreamingConv1dOp::new(config, weight, bias);
         let mut state = StreamingConv1d::default().init_state(1, 0);
@@ -296,6 +305,7 @@ mod tests {
             dilation: 1,
             padding: 0,
             pad_mode: PaddingMode::Constant,
+            groups: 1,
         };
         let op = StreamingConvTranspose1dOp::new(config, weight, bias);
         let mut state = StreamingConv1d::default().init_state(1, 0);
