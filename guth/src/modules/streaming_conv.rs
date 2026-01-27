@@ -199,6 +199,12 @@ impl<B: Backend> StreamingConvTranspose1dOp<B> {
         let emit_len = total_len - tail_len;
         let emit = output.clone().narrow(2, 0, emit_len);
         let tail = output.narrow(2, emit_len, tail_len);
+        let tail = if let Some(bias) = &self.bias {
+            let out_channels = bias.dims()[0];
+            tail.sub(bias.clone().reshape([1, out_channels, 1]))
+        } else {
+            tail
+        };
         state.history = Some(tail);
 
         Ok(emit)

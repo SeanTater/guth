@@ -8,7 +8,7 @@ use guth::modules::dummy_quantizer::DummyQuantizer;
 use guth::modules::mimi_transformer::{
     MimiProjectedTransformer, MimiProjectedTransformerConfig, MimiTransformerConfig, ProjectedOutput,
 };
-use guth::modules::seanet::{SeanetDecoder, SeanetEncoder, SeanetLayer};
+use guth::modules::seanet::{SeanetDecoder, SeanetEncoder, SeanetLayer, SeanetResnetBlock};
 use guth::modules::streaming_conv::{PaddingMode, StreamingConv1dOp, StreamingConvConfig, StreamingConvTranspose1dOp};
 
 const FIXTURE_DIR: &str = "tests/fixtures";
@@ -16,7 +16,6 @@ type TestBackend = NdArray<f32>;
 
 #[derive(Deserialize)]
 struct DummyQuantizerFixture {
-    dimension: usize,
     output_dimension: usize,
     weight: Vec<Vec<Vec<f32>>>,
     input: Vec<Vec<Vec<f32>>>,
@@ -163,14 +162,6 @@ fn tensor1_from_vec(data: Vec<f32>, device: &NdArrayDevice) -> Tensor<TestBacken
     Tensor::from_data(td, device)
 }
 
-fn tensor2_from_nested(data: Vec<Vec<f32>>, device: &NdArrayDevice) -> Tensor<TestBackend, 2> {
-    let rows = data.len();
-    let cols = data[0].len();
-    let flat: Vec<f32> = data.into_iter().flatten().collect();
-    let td = TensorData::new(flat, vec![rows, cols]);
-    Tensor::from_data(td, device)
-}
-
 fn tensor3_from_nested(data: Vec<Vec<Vec<f32>>>, device: &NdArrayDevice) -> Tensor<TestBackend, 3> {
     let b = data.len();
     let c = data[0].len();
@@ -251,7 +242,7 @@ fn build_seanet_encoder(device: &NdArrayDevice) -> SeanetEncoder<TestBackend> {
                     let res = build_conv(&conv.config, conv.weight, conv.bias, device);
                     res_layers.push(res);
                 }
-                layers.push(SeanetLayer::ResBlock(res_layers));
+                layers.push(SeanetLayer::ResBlock(SeanetResnetBlock::new(res_layers)));
             }
             _ => {}
         }
@@ -279,7 +270,7 @@ fn build_seanet_decoder(device: &NdArrayDevice) -> SeanetDecoder<TestBackend> {
                     let res = build_conv(&conv.config, conv.weight, conv.bias, device);
                     res_layers.push(res);
                 }
-                layers.push(SeanetLayer::ResBlock(res_layers));
+                layers.push(SeanetLayer::ResBlock(SeanetResnetBlock::new(res_layers)));
             }
         }
     }
@@ -287,10 +278,15 @@ fn build_seanet_decoder(device: &NdArrayDevice) -> SeanetDecoder<TestBackend> {
 }
 
 fn apply_linear(linear: &mut burn_nn::Linear<TestBackend>, weight: Vec<Vec<f32>>, device: &NdArrayDevice) {
-    let rows = weight.len();
-    let cols = weight[0].len();
-    let flat: Vec<f32> = weight.into_iter().flatten().collect();
-    let weight = Tensor::from_data(TensorData::new(flat, [rows, cols]), device);
+    let out_dim = weight.len();
+    let in_dim = weight[0].len();
+    let mut flat = Vec::with_capacity(in_dim * out_dim);
+    for c in 0..in_dim {
+        for r in 0..out_dim {
+            flat.push(weight[r][c]);
+        }
+    }
+    let weight = Tensor::from_data(TensorData::new(flat, [in_dim, out_dim]), device);
     linear.weight = Param::from_tensor(weight);
 }
 
@@ -301,9 +297,13 @@ fn apply_layer_norm(norm: &mut burn_nn::LayerNorm<TestBackend>, weights: &NormFi
     norm.beta = Some(Param::from_tensor(beta));
 }
 
-fn apply_layer_scale(scale: &mut guth::modules::layer_scale::LayerScale<TestBackend>, weights: &LayerScaleFixture, device: &NdArrayDevice) {
+fn apply_layer_scale(
+    scale: &mut guth::modules::layer_scale::LayerScale<TestBackend>,
+    weights: &LayerScaleFixture,
+    device: &NdArrayDevice,
+) {
     let weight = tensor1_from_vec(weights.scale.clone(), device);
-    scale.scale = Param::from_tensor(weight);
+    scale.scale = weight;
 }
 
 fn build_projected_transformer(
@@ -411,6 +411,8 @@ fn mimi_encode_decode_matches_fixture() {
         fixture.config.sample_rate,
         fixture.config.channels,
         fixture.config.dimension,
+        None,
+        None,
     );
 
     let audio_input = tensor3_from_nested(fixture.audio_input, &device);
@@ -419,7 +421,7 @@ fn mimi_encode_decode_matches_fixture() {
     assert_close(&latent_output, &expected_latent, 1e-4);
 
     let latent_input = tensor3_from_nested(fixture.latent_input, &device);
-    let mut state = mimi.init_state(1, latent_input.dims()[2]);
+    let mut state = mimi.init_state(1, latent_input.dims()[2], &device);
     let audio_output = mimi.decode_from_latent(latent_input, &mut state).to_data();
     let expected_audio = tensor3_from_nested(fixture.audio_output, &device).to_data();
     assert_close(&audio_output, &expected_audio, 1e-4);
@@ -450,21 +452,52 @@ fn mimi_streaming_decode_matches_batch() {
         fixture.config.sample_rate,
         fixture.config.channels,
         fixture.config.dimension,
+        None,
+        None,
     );
 
     let latent_input = tensor3_from_nested(fixture.latent_input, &device);
-    let mut batch_state = mimi.init_state(1, latent_input.dims()[2]);
+    let mut batch_state = mimi.init_state(1, latent_input.dims()[2], &device);
     let batch_audio = mimi.decode_from_latent(latent_input.clone(), &mut batch_state);
 
-    let mut stream_state = mimi.init_state(1, latent_input.dims()[2]);
-    let chunk1 = latent_input.clone().narrow(2, 0, 1);
-    let chunk2 = latent_input.clone().narrow(2, 1, latent_input.dims()[2] - 1);
+    let mut stream_state = mimi.init_state(1, latent_input.dims()[2], &device);
+    let chunk1 = latent_input.clone().narrow(2, 0, 2);
+    let chunk2 = latent_input.clone().narrow(2, 2, latent_input.dims()[2] - 2);
     let out1 = mimi.decode_from_latent(chunk1, &mut stream_state);
-    mimi.increment_step(&mut stream_state, 1);
+    mimi.increment_step(&mut stream_state, 2);
     let out2 = mimi.decode_from_latent(chunk2, &mut stream_state);
     let stream_audio = Tensor::cat(vec![out1, out2], 2);
 
     let diff = batch_audio.sub(stream_audio).abs().to_data();
+    let diff_values = diff.as_slice::<f32>().expect("diff slice");
+    let max_diff = diff_values
+        .iter()
+        .copied()
+        .fold(0.0_f32, |acc, val| acc.max(val));
+    assert!(max_diff < 1e-4, "max diff {max_diff}");
+}
+
+#[test]
+fn mimi_transformer_streaming_matches_batch() {
+    let device = NdArrayDevice::default();
+    let fixture: MimiFixture = read_fixture("mimi_model.json");
+
+    let transformer =
+        build_projected_transformer(&fixture.decoder_transformer, &fixture.config.transformer, &device);
+    let input = tensor3_from_nested(fixture.latent_input, &device);
+
+    let mut batch_state = transformer.init_state(1, &device);
+    let batch_output = transformer.forward(input.clone(), &mut batch_state).remove(0);
+
+    let mut stream_state = transformer.init_state(1, &device);
+    let chunk1 = input.clone().narrow(2, 0, 2);
+    let chunk2 = input.clone().narrow(2, 2, input.dims()[2] - 2);
+    let out1 = transformer.forward(chunk1, &mut stream_state).remove(0);
+    transformer.increment_step(&mut stream_state, 2);
+    let out2 = transformer.forward(chunk2, &mut stream_state).remove(0);
+    let stream_output = Tensor::cat(vec![out1, out2], 2);
+
+    let diff = batch_output.sub(stream_output).abs().to_data();
     let diff_values = diff.as_slice::<f32>().expect("diff slice");
     let max_diff = diff_values
         .iter()

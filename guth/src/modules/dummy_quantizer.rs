@@ -1,4 +1,6 @@
 use burn::tensor::backend::Backend;
+use burn::tensor::module::conv1d;
+use burn::tensor::ops::ConvOptions;
 use burn::tensor::Tensor;
 
 #[derive(Debug, Clone)]
@@ -11,7 +13,12 @@ impl<B: Backend> DummyQuantizer<B> {
         Self { weight }
     }
 
-    pub fn forward(&self, _input: Tensor<B, 3>) -> Tensor<B, 3> {
-        todo!("DummyQuantizer forward not implemented")
+    pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
+        conv1d(
+            input,
+            self.weight.clone(),
+            None,
+            ConvOptions::new([1], [0], [1], 1),
+        )
     }
 }

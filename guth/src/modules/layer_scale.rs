@@ -22,7 +22,7 @@ impl LayerScaleConfig {
 
 #[derive(Debug, Clone)]
 pub struct LayerScale<B: Backend> {
-    scale: Tensor<B, 1>,
+    pub scale: Tensor<B, 1>,
 }
 
 impl<B: Backend> LayerScale<B> {
