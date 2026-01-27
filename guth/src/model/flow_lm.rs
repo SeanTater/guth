@@ -1,4 +1,6 @@
 use crate::conditioner::text::LutConditioner;
+use crate::config::FlowLmConfig;
+use crate::download::download_if_necessary;
 use crate::modules::flow_net::{lsd_decode, SimpleMlpAdaLn};
 use crate::modules::transformer::{StreamingTransformer, StreamingTransformerState};
 use crate::state::StreamingModule;
@@ -61,6 +63,77 @@ impl<B: Backend> FlowLmModel<B> {
     pub fn init_state(&self, batch_size: usize, sequence_length: usize) -> FlowLmState<B> {
         let transformer = self.transformer.init_state(batch_size, sequence_length);
         FlowLmState { transformer }
+    }
+
+    pub fn from_config(
+        config: &FlowLmConfig,
+        latent_dim: usize,
+        device: &B::Device,
+    ) -> anyhow::Result<Self> {
+        let tokenizer_path = download_if_necessary(&config.lookup_table.tokenizer_path)?;
+        let conditioner = LutConditioner::new(
+            config.lookup_table.n_bins as usize,
+            tokenizer_path,
+            config.lookup_table.dim as usize,
+            config.transformer.d_model as usize,
+            device,
+        )?;
+
+        let mut flow_config = crate::modules::flow_net::SimpleMlpAdaLnConfig::new(
+            latent_dim,
+            config.flow.dim as usize,
+            latent_dim,
+            config.transformer.d_model as usize,
+        );
+        flow_config.num_res_blocks = config.flow.depth as usize;
+        flow_config.num_time_conds = 2;
+
+        let flow_net = SimpleMlpAdaLn::new(flow_config, device);
+
+        let ffn_dim = (config.transformer.d_model * config.transformer.hidden_scale) as usize;
+        let transformer = StreamingTransformer::new(
+            crate::modules::transformer::StreamingTransformerConfig {
+                num_layers: config.transformer.num_layers as usize,
+                layer: crate::modules::transformer::StreamingTransformerLayerConfig {
+                    d_model: config.transformer.d_model as usize,
+                    num_heads: config.transformer.num_heads as usize,
+                    ffn_dim,
+                    causal: true,
+                    context: None,
+                    rope_max_seq: None,
+                    rope_theta: config.transformer.max_period as f32,
+                    layer_scale: None,
+                },
+            },
+            device,
+        );
+
+        let input_linear = burn_nn::LinearConfig::new(latent_dim, config.transformer.d_model as usize)
+            .with_bias(false)
+            .init::<B>(device);
+        let out_norm = burn_nn::LayerNormConfig::new(config.transformer.d_model as usize)
+            .with_epsilon(1e-5)
+            .init::<B>(device);
+        let out_eos = burn_nn::LinearConfig::new(config.transformer.d_model as usize, 1)
+            .init::<B>(device);
+
+        let emb_std = Tensor::<B, 1>::ones([latent_dim], device);
+        let emb_mean = Tensor::<B, 1>::zeros([latent_dim], device);
+        let bos_emb = Tensor::<B, 1>::random([latent_dim], Distribution::Normal(0.0, 1.0), device);
+
+        Ok(Self::new(
+            conditioner,
+            flow_net,
+            transformer,
+            input_linear,
+            out_norm,
+            out_eos,
+            emb_std,
+            emb_mean,
+            bos_emb,
+            config.transformer.d_model as usize,
+            latent_dim,
+        ))
     }
 
     pub fn forward(

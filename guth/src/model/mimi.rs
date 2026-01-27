@@ -1,3 +1,4 @@
+use crate::config::{MimiConfig, SeanetConfig};
 use crate::modules::dummy_quantizer::DummyQuantizer;
 use crate::modules::mimi_transformer::{
     MimiProjectedTransformer, MimiTransformerState, ProjectedOutput,
@@ -5,7 +6,10 @@ use crate::modules::mimi_transformer::{
 use crate::modules::resample::{
     ConvDownsample1d, ConvDownsample1dState, ConvTrUpsample1d, ConvTrUpsample1dState,
 };
-use crate::modules::seanet::{SeanetDecoder, SeanetEncoder, SeanetLayer, SeanetState};
+use crate::modules::seanet::{SeanetDecoder, SeanetEncoder, SeanetLayer, SeanetResnetBlock, SeanetState};
+use crate::modules::streaming_conv::{
+    PaddingMode, StreamingConv1dOp, StreamingConvConfig, StreamingConvTranspose1dOp,
+};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData as BurnTensorData};
 use burn::module::Param;
@@ -78,6 +82,93 @@ impl<B: Backend> MimiModel<B> {
 
     pub fn frame_size(&self) -> usize {
         (self.sample_rate as f32 / self.frame_rate) as usize
+    }
+
+    pub fn from_config(config: &MimiConfig, device: &B::Device) -> Self {
+        let encoder = build_seanet_encoder(&config.seanet, device);
+        let decoder = build_seanet_decoder(&config.seanet, device);
+
+        let transformer = crate::modules::mimi_transformer::MimiTransformerConfig {
+            d_model: config.transformer.d_model as usize,
+            num_heads: config.transformer.num_heads as usize,
+            num_layers: config.transformer.num_layers as usize,
+            layer_scale: config.transformer.layer_scale,
+            context: config.transformer.context as usize,
+            max_period: config.transformer.max_period,
+            dim_feedforward: config.transformer.dim_feedforward as usize,
+        };
+        let projected = crate::modules::mimi_transformer::MimiProjectedTransformerConfig {
+            input_dim: config.transformer.input_dimension as usize,
+            output_dims: config
+                .transformer
+                .output_dimensions
+                .iter()
+                .map(|dim| *dim as usize)
+                .collect(),
+            transformer,
+        };
+        let encoder_transformer = MimiProjectedTransformer::new(projected.clone(), device);
+        let decoder_transformer = MimiProjectedTransformer::new(projected, device);
+
+        let quantizer_weight = Tensor::<B, 3>::zeros(
+            [
+                config.quantizer.output_dimension as usize,
+                config.quantizer.dimension as usize,
+                1,
+            ],
+            device,
+        );
+        let quantizer = DummyQuantizer::new(quantizer_weight);
+
+        let hop_length = config
+            .seanet
+            .ratios
+            .iter()
+            .fold(1usize, |acc, ratio| acc * (*ratio as usize));
+        let encoder_frame_rate = config.sample_rate as f32 / hop_length as f32;
+
+        let mut downsample = None;
+        let mut upsample = None;
+        if (encoder_frame_rate - config.frame_rate).abs() > f32::EPSILON {
+            let stride = (encoder_frame_rate / config.frame_rate).round() as usize;
+            let down_weight = Tensor::<B, 3>::zeros(
+                [
+                    config.seanet.dimension as usize,
+                    config.seanet.dimension as usize,
+                    2 * stride,
+                ],
+                device,
+            );
+            let up_weight = Tensor::<B, 3>::zeros(
+                [
+                    config.seanet.dimension as usize,
+                    1,
+                    2 * stride,
+                ],
+                device,
+            );
+            downsample = Some(ConvDownsample1d::new(stride, down_weight));
+            upsample = Some(ConvTrUpsample1d::new(
+                stride,
+                up_weight,
+                config.seanet.dimension as usize,
+            ));
+        }
+
+        MimiModel::new(
+            encoder,
+            decoder,
+            encoder_transformer,
+            decoder_transformer,
+            quantizer,
+            config.frame_rate,
+            encoder_frame_rate,
+            config.sample_rate as usize,
+            config.channels as usize,
+            config.seanet.dimension as usize,
+            downsample,
+            upsample,
+        )
     }
 
     pub fn init_state(&self, batch_size: usize, _sequence_length: usize, device: &B::Device) -> MimiState<B> {
@@ -212,6 +303,198 @@ impl<B: Backend> MimiModel<B> {
 
         Ok(())
     }
+}
+
+fn pad_mode_from_str(value: &str) -> PaddingMode {
+    match value {
+        "replicate" | "reflect" => PaddingMode::Replicate,
+        _ => PaddingMode::Constant,
+    }
+}
+
+fn conv_config(
+    kernel_size: usize,
+    stride: usize,
+    dilation: usize,
+    pad_mode: PaddingMode,
+) -> StreamingConvConfig {
+    StreamingConvConfig {
+        kernel_size,
+        stride,
+        dilation,
+        padding: 0,
+        pad_mode,
+        groups: 1,
+    }
+}
+
+fn conv1d<B: Backend>(
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    stride: usize,
+    dilation: usize,
+    pad_mode: PaddingMode,
+    device: &B::Device,
+) -> StreamingConv1dOp<B> {
+    let weight = Tensor::<B, 3>::zeros([out_channels, in_channels, kernel_size], device);
+    let bias = Tensor::<B, 1>::zeros([out_channels], device);
+    StreamingConv1dOp::new(conv_config(kernel_size, stride, dilation, pad_mode), weight, Some(bias))
+}
+
+fn conv_transpose<B: Backend>(
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    stride: usize,
+    pad_mode: PaddingMode,
+    device: &B::Device,
+) -> StreamingConvTranspose1dOp<B> {
+    let config = StreamingConvConfig {
+        kernel_size,
+        stride,
+        dilation: 1,
+        padding: 0,
+        pad_mode,
+        groups: 1,
+    };
+    let weight = Tensor::<B, 3>::zeros([in_channels, out_channels, kernel_size], device);
+    let bias = Tensor::<B, 1>::zeros([out_channels], device);
+    StreamingConvTranspose1dOp::new(config, weight, Some(bias))
+}
+
+fn build_seanet_encoder<B: Backend>(config: &SeanetConfig, device: &B::Device) -> SeanetEncoder<B> {
+    let pad_mode = pad_mode_from_str(&config.pad_mode);
+    let mut layers = Vec::new();
+    let mut mult = 1usize;
+    layers.push(SeanetLayer::Conv1d(conv1d(
+        config.channels as usize,
+        mult * config.n_filters as usize,
+        config.kernel_size as usize,
+        1,
+        1,
+        pad_mode,
+        device,
+    )));
+
+    let ratios: Vec<usize> = config.ratios.iter().map(|v| *v as usize).collect();
+    for ratio in ratios.iter().rev().copied() {
+        for j in 0..config.n_residual_layers {
+            let mut res_layers = Vec::new();
+            let hidden = (mult * config.n_filters as usize) / config.compress as usize;
+            let dilation = (config.dilation_base as usize).pow(j as u32);
+            res_layers.push(conv1d(
+                mult * config.n_filters as usize,
+                hidden,
+                config.residual_kernel_size as usize,
+                1,
+                dilation,
+                pad_mode,
+                device,
+            ));
+            res_layers.push(conv1d(
+                hidden,
+                mult * config.n_filters as usize,
+                1,
+                1,
+                1,
+                pad_mode,
+                device,
+            ));
+            layers.push(SeanetLayer::ResBlock(SeanetResnetBlock::new(res_layers)));
+        }
+
+        layers.push(SeanetLayer::Elu);
+        layers.push(SeanetLayer::Conv1d(conv1d(
+            mult * config.n_filters as usize,
+            mult * config.n_filters as usize * 2,
+            ratio * 2,
+            ratio,
+            1,
+            pad_mode,
+            device,
+        )));
+        mult *= 2;
+    }
+
+    layers.push(SeanetLayer::Elu);
+    layers.push(SeanetLayer::Conv1d(conv1d(
+        mult * config.n_filters as usize,
+        config.dimension as usize,
+        config.last_kernel_size as usize,
+        1,
+        1,
+        pad_mode,
+        device,
+    )));
+
+    SeanetEncoder::new(layers)
+}
+
+fn build_seanet_decoder<B: Backend>(config: &SeanetConfig, device: &B::Device) -> SeanetDecoder<B> {
+    let pad_mode = pad_mode_from_str(&config.pad_mode);
+    let ratios: Vec<usize> = config.ratios.iter().map(|v| *v as usize).collect();
+    let mut mult = 2usize.pow(ratios.len() as u32);
+    let mut layers = Vec::new();
+    layers.push(SeanetLayer::Conv1d(conv1d(
+        config.dimension as usize,
+        mult * config.n_filters as usize,
+        config.kernel_size as usize,
+        1,
+        1,
+        pad_mode,
+        device,
+    )));
+
+    for ratio in ratios {
+        layers.push(SeanetLayer::Elu);
+        layers.push(SeanetLayer::ConvTranspose1d(conv_transpose(
+            mult * config.n_filters as usize,
+            (mult * config.n_filters as usize) / 2,
+            ratio * 2,
+            ratio,
+            pad_mode,
+            device,
+        )));
+        for j in 0..config.n_residual_layers {
+            let mut res_layers = Vec::new();
+            let hidden = (mult * config.n_filters as usize) / (2 * config.compress as usize);
+            let dilation = (config.dilation_base as usize).pow(j as u32);
+            res_layers.push(conv1d(
+                (mult * config.n_filters as usize) / 2,
+                hidden,
+                config.residual_kernel_size as usize,
+                1,
+                dilation,
+                pad_mode,
+                device,
+            ));
+            res_layers.push(conv1d(
+                hidden,
+                (mult * config.n_filters as usize) / 2,
+                1,
+                1,
+                1,
+                pad_mode,
+                device,
+            ));
+            layers.push(SeanetLayer::ResBlock(SeanetResnetBlock::new(res_layers)));
+        }
+        mult /= 2;
+    }
+
+    layers.push(SeanetLayer::Elu);
+    layers.push(SeanetLayer::Conv1d(conv1d(
+        config.n_filters as usize,
+        config.channels as usize,
+        config.last_kernel_size as usize,
+        1,
+        1,
+        pad_mode,
+        device,
+    )));
+
+    SeanetDecoder::new(layers)
 }
 
 fn tensor_f32(tensor: &crate::weights::TensorData) -> anyhow::Result<Vec<f32>> {

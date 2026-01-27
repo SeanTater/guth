@@ -1,8 +1,12 @@
 use crate::model::flow_lm::{FlowLmModel, FlowLmState};
 use crate::model::mimi::{MimiModel, MimiState};
+use crate::config::Config;
+use crate::download::download_if_necessary;
+use crate::weights::{load_flow_lm_state_dict, load_mimi_state_dict, load_tts_state_dict};
 use burn::tensor::backend::Backend;
 use burn::tensor::module::linear;
 use burn::tensor::{Bool, ElementConversion, Int, Tensor};
+use std::sync::mpsc::{self, Receiver};
 
 #[derive(Debug)]
 pub struct TtsState<B: Backend> {
@@ -41,6 +45,85 @@ impl<B: Backend> TtsModel<B> {
             noise_clamp,
             eos_threshold,
         }
+    }
+
+    pub fn from_config(
+        config: &Config,
+        temp: f32,
+        lsd_decode_steps: usize,
+        noise_clamp: Option<f32>,
+        eos_threshold: f32,
+        device: &B::Device,
+    ) -> anyhow::Result<Self> {
+        let latent_dim = config.mimi.quantizer.dimension as usize;
+        let mut flow_lm = FlowLmModel::from_config(&config.flow_lm, latent_dim, device)?;
+        let mut mimi = MimiModel::from_config(&config.mimi, device);
+
+        let mut speaker_proj_weight =
+            Tensor::<B, 2>::zeros([flow_lm.dim, flow_lm.ldim], device);
+
+        if let Some(weights_path) = config.weights_path.as_ref() {
+            let weights_path = match download_if_necessary(weights_path) {
+                Ok(path) => path,
+                Err(err) => {
+                    if let Some(fallback) = config.weights_path_without_voice_cloning.as_ref() {
+                        download_if_necessary(fallback)?
+                    } else {
+                        return Err(err);
+                    }
+                }
+            };
+            let tts_state = load_tts_state_dict(weights_path)?;
+            if !tts_state.flow_lm.is_empty() {
+                flow_lm.load_state_dict(&tts_state.flow_lm, device)?;
+            }
+            if !tts_state.mimi.is_empty() {
+                mimi.load_state_dict(&tts_state.mimi, device)?;
+            }
+            if let Some(weight) = tts_state.speaker_proj_weight {
+                speaker_proj_weight = tensor2_from_data(&weight, device)?;
+            }
+            return Ok(Self::new(
+                flow_lm,
+                mimi,
+                speaker_proj_weight,
+                temp,
+                lsd_decode_steps,
+                noise_clamp,
+                eos_threshold,
+            ));
+        }
+
+        if let Some(flow_path) = config.flow_lm.weights_path.as_ref() {
+            if config.mimi.weights_path.is_none() {
+                anyhow::bail!("mimi.weights_path must be set when flow_lm.weights_path is provided");
+            }
+            let flow_path = download_if_necessary(flow_path)?;
+            let flow_state = load_flow_lm_state_dict(flow_path)?;
+            flow_lm.load_state_dict(&flow_state, device)?;
+            if let Some(weight) = flow_state.get("speaker_proj_weight") {
+                speaker_proj_weight = tensor2_from_data(weight, device)?;
+            }
+        }
+
+        if let Some(mimi_path) = config.mimi.weights_path.as_ref() {
+            if config.flow_lm.weights_path.is_none() {
+                anyhow::bail!("flow_lm.weights_path must be set when mimi.weights_path is provided");
+            }
+            let mimi_path = download_if_necessary(mimi_path)?;
+            let mimi_state = load_mimi_state_dict(mimi_path)?;
+            mimi.load_state_dict(&mimi_state, device)?;
+        }
+
+        Ok(Self::new(
+            flow_lm,
+            mimi,
+            speaker_proj_weight,
+            temp,
+            lsd_decode_steps,
+            noise_clamp,
+            eos_threshold,
+        ))
     }
 
     pub fn init_state(
@@ -110,27 +193,11 @@ impl<B: Backend> TtsModel<B> {
     pub fn decode_latents(&self, latents: Tensor<B, 3>, state: &mut TtsState<B>) -> Tensor<B, 3> {
         let [_batch, steps, _] = latents.dims();
         let mut audio_chunks = Vec::with_capacity(steps);
-        let emb_mean = self
-            .flow_lm
-            .emb_mean
-            .clone()
-            .reshape([1, 1, self.flow_lm.ldim]);
-        let emb_std = self
-            .flow_lm
-            .emb_std
-            .clone()
-            .reshape([1, 1, self.flow_lm.ldim]);
-
         for idx in 0..steps {
             let latent = latents.clone().narrow(1, idx, 1);
-            let decoded = latent.mul(emb_std.clone()).add(emb_mean.clone());
-            let transposed = decoded.swap_dims(1, 2);
-            let quantized = self.mimi.quantizer.forward(transposed);
-            let audio = self.mimi.decode_from_latent(quantized, &mut state.mimi);
-            self.mimi.increment_step(&mut state.mimi, 1);
+            let audio = self.decode_latent_step(latent, &mut state.mimi);
             audio_chunks.push(audio);
         }
-
         Tensor::cat(audio_chunks, 2)
     }
 
@@ -147,6 +214,56 @@ impl<B: Backend> TtsModel<B> {
         (latents, eos, audio)
     }
 
+    /// Spawn a background worker to generate audio chunks and stream them over a channel.
+    pub fn generate_audio_stream(
+        self,
+        tokens: Tensor<B, 2, Int>,
+        max_gen_len: usize,
+        frames_after_eos: usize,
+    ) -> Receiver<Tensor<B, 3>>
+    where
+        B: Backend + Send + Sync + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let device = tokens.device();
+            let flow_len = tokens.dims()[1] + max_gen_len + 1;
+            let mut state = self.init_state(1, flow_len, max_gen_len, &device);
+
+            self.run_flow_lm_and_increment(&mut state, Some(tokens), None, None);
+
+            let mut backbone_input = Tensor::<B, 3>::full(
+                [1, 1, self.flow_lm.ldim],
+                f32::NAN,
+                &device,
+            );
+            let mut eos_step: Option<usize> = None;
+            for step in 0..max_gen_len {
+                let (latent, is_eos) =
+                    self.run_flow_lm_and_increment(&mut state, None, Some(backbone_input.clone()), None);
+                if eos_step.is_none() {
+                    let eos_any = is_eos.clone().any().into_scalar();
+                    if eos_any.elem() {
+                        eos_step = Some(step);
+                    }
+                }
+                if let Some(eos_step) = eos_step {
+                    if step >= eos_step + frames_after_eos {
+                        break;
+                    }
+                }
+
+                let latent_step = latent.clone().reshape([1, 1, self.flow_lm.ldim]);
+                let audio = self.decode_latent_step(latent_step, &mut state.mimi);
+                if tx.send(audio).is_err() {
+                    break;
+                }
+                backbone_input = latent.reshape([1, 1, self.flow_lm.ldim]);
+            }
+        });
+        rx
+    }
+
     pub fn condition_on_audio(&self, audio_prompt: Tensor<B, 3>, state: &mut TtsState<B>) {
         let latents = self.mimi.encode_to_latent(audio_prompt);
         let latents = latents.swap_dims(1, 2);
@@ -161,6 +278,7 @@ impl<B: Backend> TtsModel<B> {
         backbone_input_latents: Option<Tensor<B, 3>>,
         audio_conditioning: Option<Tensor<B, 3>>,
     ) -> (Tensor<B, 3>, Tensor<B, 2, Bool>) {
+        // FlowLM manages its own KV cache append; no explicit increment needed here.
         let device = self.flow_lm.bos_emb.device();
 
         let text_tokens = text_tokens.unwrap_or_else(|| {
@@ -200,4 +318,44 @@ impl<B: Backend> TtsModel<B> {
         let latent = latent.reshape([latent_dims[0], 1, latent_dims[1]]);
         (latent, is_eos)
     }
+
+    fn decode_latent_step(
+        &self,
+        latent: Tensor<B, 3>,
+        state: &mut MimiState<B>,
+    ) -> Tensor<B, 3> {
+        let emb_mean = self
+            .flow_lm
+            .emb_mean
+            .clone()
+            .reshape([1, 1, self.flow_lm.ldim]);
+        let emb_std = self
+            .flow_lm
+            .emb_std
+            .clone()
+            .reshape([1, 1, self.flow_lm.ldim]);
+        let decoded = latent.mul(emb_std).add(emb_mean);
+        let transposed = decoded.swap_dims(1, 2);
+        let quantized = self.mimi.quantizer.forward(transposed);
+        let audio = self.mimi.decode_from_latent(quantized, state);
+        self.mimi.increment_step(state, 1);
+        audio
+    }
+}
+
+fn tensor2_from_data<B: Backend>(
+    tensor: &crate::weights::TensorData,
+    device: &B::Device,
+) -> anyhow::Result<Tensor<B, 2>> {
+    let shape: [usize; 2] = tensor.shape.clone().try_into().map_err(|_| {
+        anyhow::anyhow!("Expected 2D tensor, got shape {:?}", tensor.shape)
+    })?;
+    if tensor.dtype != safetensors::Dtype::F32 {
+        anyhow::bail!("Unsupported dtype {:?}", tensor.dtype);
+    }
+    let mut values = Vec::with_capacity(tensor.data.len() / 4);
+    for chunk in tensor.data.chunks_exact(4) {
+        values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    Ok(Tensor::from_data(burn::tensor::TensorData::new(values, shape), device))
 }
