@@ -4,3 +4,4 @@ pub mod resample;
 pub mod seanet;
 pub mod streaming_conv;
 pub mod streaming_mha;
+pub mod transformer;

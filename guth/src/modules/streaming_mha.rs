@@ -105,7 +105,19 @@ impl<B: Backend> StreamingMhaOp<B> {
         let values = state.values.clone().expect("values must be set");
         let batch = queries.dims()[0];
         let heads = queries.dims()[1];
-        let mask = self.build_mask(batch, heads, queries.dims()[2], keys.dims()[2], &queries.device());
+        let q_len = queries.dims()[2];
+        let k_len = keys.dims()[2];
+        let q_start = state.step.index.saturating_sub(q_len);
+        let k_start = state.step.index.saturating_sub(state.cached_tokens);
+        let mask = self.build_mask(
+            batch,
+            heads,
+            q_len,
+            q_start,
+            k_len,
+            k_start,
+            &queries.device(),
+        );
         attention(queries, keys, values, mask)
     }
 
@@ -114,19 +126,23 @@ impl<B: Backend> StreamingMhaOp<B> {
         batch: usize,
         heads: usize,
         q_len: usize,
+        q_start: usize,
         k_len: usize,
+        k_start: usize,
         device: &B::Device,
     ) -> Option<Tensor<B, 4, Bool>> {
         if !self.config.causal && self.config.context.is_none() {
             return None;
         }
 
-        let q: Tensor<B, 2, Int> = Tensor::<B, 1, Int>::arange(0..q_len as i64, device)
-            .unsqueeze::<2>()
-            .repeat_dim(1, k_len);
-        let k: Tensor<B, 2, Int> = Tensor::<B, 1, Int>::arange(0..k_len as i64, device)
-            .unsqueeze::<2>()
-            .repeat_dim(0, q_len);
+        let q: Tensor<B, 2, Int> =
+            Tensor::<B, 1, Int>::arange(q_start as i64..(q_start + q_len) as i64, device)
+                .unsqueeze_dim::<2>(1)
+                .repeat_dim(1, k_len);
+        let k: Tensor<B, 2, Int> =
+            Tensor::<B, 1, Int>::arange(k_start as i64..(k_start + k_len) as i64, device)
+                .unsqueeze_dim::<2>(0)
+                .repeat_dim(0, q_len);
         let mut mask: Tensor<B, 2, Bool> = k.clone().greater(q.clone());
 
         if let Some(context) = self.config.context {
