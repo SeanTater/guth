@@ -46,3 +46,31 @@ impl StateTree {
         self.steps.get(key)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{StateTree, StreamStep};
+
+    #[test]
+    fn stream_step_increments() {
+        let mut step = StreamStep::new();
+        step.increment(2);
+        assert_eq!(step.index, 2);
+        step.increment(0);
+        assert_eq!(step.index, 2);
+    }
+
+    #[test]
+    fn state_tree_gets_and_sets() {
+        let mut tree = StateTree::default();
+        assert!(tree.step("missing").is_none());
+
+        tree.set_step("flow", StreamStep { index: 5 });
+        assert_eq!(tree.step("flow").map(|s| s.index), Some(5));
+
+        if let Some(step) = tree.step_mut("flow") {
+            step.increment(3);
+        }
+        assert_eq!(tree.step("flow").map(|s| s.index), Some(8));
+    }
+}

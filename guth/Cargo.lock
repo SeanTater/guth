@@ -2939,6 +2939,7 @@ dependencies = [
  "sentencepiece",
  "serde",
  "serde_yaml",
+ "tempfile",
  "tracing",
 ]
 

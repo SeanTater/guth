@@ -73,3 +73,72 @@ pub fn load_mimi_state_dict(path: impl AsRef<Path>) -> Result<HashMap<String, Te
 
     Ok(state)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use safetensors::tensor::TensorView;
+    use safetensors::serialize;
+    use std::collections::HashMap;
+    use std::fs;
+
+    fn write_safetensors(path: &Path, tensors: HashMap<String, TensorView<'_>>) {
+        let bytes = serialize(&tensors, &None).expect("serialize safetensors");
+        fs::write(path, bytes).expect("write safetensors");
+    }
+
+    #[test]
+    fn flow_lm_filters_and_renames() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("flow.safetensors");
+
+        let data: Vec<u8> = vec![0.0f32, 1.0].into_iter().flat_map(f32::to_le_bytes).collect();
+        let tensor = TensorView::new(Dtype::F32, vec![2], &data).expect("tensor view");
+
+        let tensors: HashMap<String, TensorView<'_>> = vec![
+            (
+                "condition_provider.conditioners.transcript_in_segment.embed.weight".to_string(),
+                tensor.clone(),
+            ),
+            (
+                "condition_provider.conditioners.speaker_wavs.output_proj.weight".to_string(),
+                tensor.clone(),
+            ),
+            ("flow.w_s_t.skip".to_string(), tensor),
+        ]
+        .into_iter()
+        .collect();
+
+        write_safetensors(&path, tensors);
+
+        let state = load_flow_lm_state_dict(&path).expect("load flow lm state");
+        assert!(state.contains_key("conditioner.embed.weight"));
+        assert!(state.contains_key("speaker_proj_weight"));
+        assert!(!state.contains_key("flow.w_s_t.skip"));
+    }
+
+    #[test]
+    fn mimi_filters_and_strips_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mimi.safetensors");
+
+        let data: Vec<u8> = vec![0.0f32].into_iter().flat_map(f32::to_le_bytes).collect();
+        let tensor = TensorView::new(Dtype::F32, vec![1], &data).expect("tensor view");
+
+        let tensors: HashMap<String, TensorView<'_>> = vec![
+            ("model.encoder.weight".to_string(), tensor.clone()),
+            ("model.quantizer.vq.skip".to_string(), tensor.clone()),
+            ("model.quantizer.logvar_proj.weight".to_string(), tensor),
+        ]
+        .into_iter()
+        .collect();
+
+        write_safetensors(&path, tensors);
+
+        let state = load_mimi_state_dict(&path).expect("load mimi state");
+        assert!(state.contains_key("encoder.weight"));
+        assert!(!state.contains_key("model.encoder.weight"));
+        assert!(!state.contains_key("quantizer.vq.skip"));
+        assert!(!state.contains_key("quantizer.logvar_proj.weight"));
+    }
+}
