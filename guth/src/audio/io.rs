@@ -1,5 +1,7 @@
 use anyhow::Result;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
+use std::fs::File;
+use std::io::BufWriter;
 use std::path::Path;
 
 #[derive(Debug, Default)]
@@ -65,6 +67,49 @@ impl WavIo {
         }
 
         writer.finalize()?;
+        Ok(())
+    }
+}
+
+pub struct StreamingWavWriter {
+    writer: WavWriter<BufWriter<File>>,
+    channels: usize,
+}
+
+impl StreamingWavWriter {
+    pub fn create(path: impl AsRef<Path>, sample_rate: u32, channels: usize) -> Result<Self> {
+        let spec = WavSpec {
+            channels: channels as u16,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        let writer = WavWriter::create(path, spec)?;
+        Ok(Self { writer, channels })
+    }
+
+    pub fn write_chunk(&mut self, samples: &[Vec<f32>]) -> Result<()> {
+        if samples.len() != self.channels {
+            anyhow::bail!("Streaming WAV chunk has wrong channel count");
+        }
+        let len = samples[0].len();
+        for channel in samples.iter().skip(1) {
+            if channel.len() != len {
+                anyhow::bail!("Streaming WAV chunk length mismatch");
+            }
+        }
+        for idx in 0..len {
+            for channel in samples {
+                let value = channel[idx].clamp(-1.0, 1.0);
+                let scaled = (value * i16::MAX as f32).round() as i16;
+                self.writer.write_sample(scaled)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finalize(self) -> Result<()> {
+        self.writer.finalize()?;
         Ok(())
     }
 }
