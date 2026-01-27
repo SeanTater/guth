@@ -1,0 +1,204 @@
+use burn::tensor::{Tensor, TensorData};
+use burn_ndarray::{NdArray, NdArrayDevice};
+use serde::Deserialize;
+
+use guth::modules::streaming_conv::{
+    PaddingMode, StreamingConv1d, StreamingConv1dOp, StreamingConvConfig,
+    StreamingConvTranspose1dOp,
+};
+use guth::modules::streaming_mha::{StreamingMha, StreamingMhaConfig, StreamingMhaOp};
+use guth::state::StreamingModule;
+
+const FIXTURE_DIR: &str = "tests/fixtures";
+
+type TestBackend = NdArray<f32>;
+
+#[derive(Deserialize)]
+struct Conv1dFixture {
+    config: Conv1dConfigFixture,
+    weight: Vec<Vec<Vec<f32>>>,
+    bias: Vec<f32>,
+    chunks: Vec<Vec<Vec<Vec<f32>>>>,
+    outputs: Vec<Vec<Vec<Vec<f32>>>>,
+}
+
+#[derive(Deserialize)]
+struct Conv1dConfigFixture {
+    kernel_size: usize,
+    stride: usize,
+    dilation: usize,
+    padding: usize,
+    pad_mode: String,
+}
+
+#[derive(Deserialize)]
+struct ConvTransposeFixture {
+    config: ConvTransposeConfigFixture,
+    weight: Vec<Vec<Vec<f32>>>,
+    bias: Vec<f32>,
+    chunk: Vec<Vec<Vec<f32>>>,
+    emit: Vec<Vec<Vec<f32>>>,
+    flush: Vec<Vec<Vec<f32>>>,
+}
+
+#[derive(Deserialize)]
+struct ConvTransposeConfigFixture {
+    kernel_size: usize,
+    stride: usize,
+    dilation: usize,
+    padding: usize,
+}
+
+#[derive(Deserialize)]
+struct AttentionFixture {
+    config: AttentionConfigFixture,
+    keys: Vec<Vec<Vec<Vec<f32>>>>,
+    values: Vec<Vec<Vec<Vec<f32>>>>,
+    queries: Vec<Vec<Vec<Vec<f32>>>>,
+    output: Vec<Vec<Vec<Vec<f32>>>>,
+}
+
+#[derive(Deserialize)]
+struct AttentionConfigFixture {
+    num_heads: usize,
+    head_dim: usize,
+    causal: bool,
+}
+
+fn read_fixture<T: for<'de> Deserialize<'de>>(name: &str) -> T {
+    let path = format!("{FIXTURE_DIR}/{name}");
+    let data = std::fs::read_to_string(path).expect("fixture read");
+    serde_json::from_str(&data).expect("fixture parse")
+}
+
+fn assert_close(a: &TensorData, b: &TensorData, tol: f32) {
+    let a_slice = a.as_slice::<f32>().expect("a slice");
+    let b_slice = b.as_slice::<f32>().expect("b slice");
+    assert_eq!(a_slice.len(), b_slice.len());
+    for (idx, (x, y)) in a_slice.iter().zip(b_slice.iter()).enumerate() {
+        if (x - y).abs() > tol {
+            panic!("mismatch at {idx}: {x} vs {y}");
+        }
+    }
+}
+
+fn tensor1_from_vec(data: Vec<f32>, device: &NdArrayDevice) -> Tensor<TestBackend, 1> {
+    let len = data.len();
+    let td = TensorData::new(data, vec![len]);
+    Tensor::from_data(td, device)
+}
+
+fn tensor3_from_nested(data: Vec<Vec<Vec<f32>>>, device: &NdArrayDevice) -> Tensor<TestBackend, 3> {
+    let b = data.len();
+    let c = data[0].len();
+    let t = data[0][0].len();
+    let mut flat = Vec::with_capacity(b * c * t);
+    for bb in data {
+        for cc in bb {
+            for val in cc {
+                flat.push(val);
+            }
+        }
+    }
+    let td = TensorData::new(flat, vec![b, c, t]);
+    Tensor::from_data(td, device)
+}
+
+fn tensor4_from_nested(data: Vec<Vec<Vec<Vec<f32>>>>, device: &NdArrayDevice) -> Tensor<TestBackend, 4> {
+    let b = data.len();
+    let h = data[0].len();
+    let t = data[0][0].len();
+    let d = data[0][0][0].len();
+    let mut flat = Vec::with_capacity(b * h * t * d);
+    for bb in data {
+        for hh in bb {
+            for tt in hh {
+                for val in tt {
+                    flat.push(val);
+                }
+            }
+        }
+    }
+    let td = TensorData::new(flat, vec![b, h, t, d]);
+    Tensor::from_data(td, device)
+}
+
+#[test]
+fn parity_conv1d_streaming() {
+    let device = NdArrayDevice::default();
+    let fixture: Conv1dFixture = read_fixture("conv1d.json");
+    let pad_mode = match fixture.config.pad_mode.as_str() {
+        "Replicate" => PaddingMode::Replicate,
+        _ => PaddingMode::Constant,
+    };
+    let config = StreamingConvConfig {
+        kernel_size: fixture.config.kernel_size,
+        stride: fixture.config.stride,
+        dilation: fixture.config.dilation,
+        padding: fixture.config.padding,
+        pad_mode,
+    };
+    let weight = tensor3_from_nested(fixture.weight, &device);
+    let bias = tensor1_from_vec(fixture.bias, &device);
+    let op = StreamingConv1dOp::new(config, weight, Some(bias));
+    let mut state = StreamingConv1d::default().init_state(1, 0);
+
+    for (chunk, expected) in fixture.chunks.into_iter().zip(fixture.outputs.into_iter()) {
+        let input = tensor3_from_nested(chunk, &device);
+        let output = op.forward(&mut state, input).to_data();
+        let expected = tensor3_from_nested(expected, &device).to_data();
+        assert_close(&output, &expected, 1e-4);
+    }
+}
+
+#[test]
+fn parity_conv_transpose_streaming() {
+    let device = NdArrayDevice::default();
+    let fixture: ConvTransposeFixture = read_fixture("conv_transpose.json");
+    let config = StreamingConvConfig {
+        kernel_size: fixture.config.kernel_size,
+        stride: fixture.config.stride,
+        dilation: fixture.config.dilation,
+        padding: fixture.config.padding,
+        pad_mode: PaddingMode::Constant,
+    };
+    let weight = tensor3_from_nested(fixture.weight, &device);
+    let bias = tensor1_from_vec(fixture.bias, &device);
+    let op = StreamingConvTranspose1dOp::new(config, weight, Some(bias));
+    let mut state = StreamingConv1d::default().init_state(1, 0);
+
+    let input = tensor3_from_nested(fixture.chunk, &device);
+    let output = op.forward(&mut state, input).unwrap().to_data();
+    let expected = tensor3_from_nested(fixture.emit, &device).to_data();
+    assert_close(&output, &expected, 1e-4);
+
+    let flush = op
+        .forward(&mut state, Tensor::<TestBackend, 3>::zeros([1, 1, 0], &device))
+        .unwrap()
+        .to_data();
+    let expected_flush = tensor3_from_nested(fixture.flush, &device).to_data();
+    assert_close(&flush, &expected_flush, 1e-4);
+}
+
+#[test]
+fn parity_attention() {
+    let device = NdArrayDevice::default();
+    let fixture: AttentionFixture = read_fixture("attention.json");
+    let config = StreamingMhaConfig {
+        num_heads: fixture.config.num_heads,
+        head_dim: fixture.config.head_dim,
+        causal: fixture.config.causal,
+        ..Default::default()
+    };
+    let op = StreamingMhaOp::<TestBackend>::new(config, &device);
+    let mut state = StreamingMha::default().init_state(1, 0);
+
+    let keys = tensor4_from_nested(fixture.keys, &device);
+    let values = tensor4_from_nested(fixture.values, &device);
+    op.append_kv(&mut state, keys, values);
+
+    let queries = tensor4_from_nested(fixture.queries, &device);
+    let output = op.attention(&state, queries).to_data();
+    let expected = tensor4_from_nested(fixture.output, &device).to_data();
+    assert_close(&output, &expected, 1e-4);
+}

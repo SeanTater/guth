@@ -2939,6 +2939,7 @@ dependencies = [
  "safetensors 0.4.5",
  "sentencepiece",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tempfile",
  "tracing",
