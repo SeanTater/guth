@@ -1,12 +1,10 @@
 use crate::modules::layer_scale::{LayerScale, LayerScaleConfig};
+use crate::modules::linear::apply_linear_3d as apply_linear;
 use burn::tensor::activation::gelu;
 use burn::tensor::backend::Backend;
 use burn::tensor::module::attention;
 use burn::tensor::{Bool, Int, Tensor};
 use burn_nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig};
-use crate::modules::linear::apply_linear_3d;
-#[cfg(feature = "backend-cpu")]
-use std::any::TypeId;
 
 #[derive(Debug, Clone)]
 pub struct MimiTransformerConfig {
@@ -82,103 +80,11 @@ pub struct MimiProjectedTransformer<B: Backend> {
     pub transformer: MimiTransformer<B>,
 }
 
-fn apply_linear<B: Backend + 'static>(linear: &Linear<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
-    apply_linear_3d(linear, input)
-}
-
 fn apply_layer_norm<B: Backend>(norm: &LayerNorm<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
     let [batch, seq, dim] = input.dims();
     let flat = input.reshape([batch * seq, dim]);
     let output = norm.forward(flat);
     output.reshape([batch, seq, dim])
-}
-
-#[cfg(feature = "backend-cpu")]
-fn attention_cpu<B: Backend>(
-    q: Tensor<B, 4>,
-    k: Tensor<B, 4>,
-    v: Tensor<B, 4>,
-    mask: Option<Tensor<B, 4, Bool>>,
-) -> Tensor<B, 4> {
-    let [batch, heads, q_len, head_dim] = q.dims();
-    let k_len = k.dims()[2];
-    let device = q.device();
-
-    if batch == 0 || heads == 0 || q_len == 0 || k_len == 0 || head_dim == 0 {
-        return Tensor::from_data(
-            burn::tensor::TensorData::new(Vec::<f32>::new(), [batch, heads, 0, head_dim]),
-            &device,
-        );
-    }
-
-    let q_data = q.to_data();
-    let k_data = k.to_data();
-    let v_data = v.to_data();
-    let q_vals = q_data.as_slice::<f32>().expect("cpu attention expects f32 queries");
-    let k_vals = k_data.as_slice::<f32>().expect("cpu attention expects f32 keys");
-    let v_vals = v_data.as_slice::<f32>().expect("cpu attention expects f32 values");
-
-    let mask_data = mask.as_ref().map(|mask| mask.to_data());
-    let mask_vals = mask_data
-        .as_ref()
-        .map(|data| data.as_slice::<u8>().expect("cpu attention expects bool mask"));
-
-    let scale = (head_dim as f32).sqrt();
-    let mut output = vec![0.0f32; batch * heads * q_len * head_dim];
-
-    for b in 0..batch {
-        for h in 0..heads {
-            for q_idx in 0..q_len {
-                let mut scores = vec![0.0f32; k_len];
-                for k_idx in 0..k_len {
-                    let mut acc = 0.0f32;
-                    for d in 0..head_dim {
-                        let q_offset = (((b * heads + h) * q_len + q_idx) * head_dim) + d;
-                        let k_offset = (((b * heads + h) * k_len + k_idx) * head_dim) + d;
-                        acc += q_vals[q_offset] * k_vals[k_offset];
-                    }
-                    let mut score = acc / scale;
-                    if let Some(mask_vals) = mask_vals {
-                        let m_idx = (((b * heads + h) * q_len + q_idx) * k_len) + k_idx;
-                        if mask_vals[m_idx] != 0 {
-                            score = -1.0e9;
-                        }
-                    }
-                    scores[k_idx] = score;
-                }
-
-                let mut max = f32::NEG_INFINITY;
-                for score in &scores {
-                    if *score > max {
-                        max = *score;
-                    }
-                }
-
-                let mut denom = 0.0f32;
-                for score in &mut scores {
-                    *score = (*score - max).exp();
-                    denom += *score;
-                }
-                if denom == 0.0 {
-                    continue;
-                }
-
-                for k_idx in 0..k_len {
-                    let weight = scores[k_idx] / denom;
-                    for d in 0..head_dim {
-                        let out_idx = (((b * heads + h) * q_len + q_idx) * head_dim) + d;
-                        let v_idx = (((b * heads + h) * k_len + k_idx) * head_dim) + d;
-                        output[out_idx] += weight * v_vals[v_idx];
-                    }
-                }
-            }
-        }
-    }
-
-    Tensor::from_data(
-        burn::tensor::TensorData::new(output, [batch, heads, q_len, head_dim]),
-        &device,
-    )
 }
 
 fn positions_from_offset<B: Backend>(
@@ -328,18 +234,7 @@ impl<B: Backend + 'static> MimiSelfAttention<B> {
         let allowed = allowed.unsqueeze_dim::<4>(1).repeat_dim(1, heads);
         let mask = allowed.bool_not();
 
-        let attended = {
-            #[cfg(feature = "backend-cpu")]
-            if TypeId::of::<B>() == TypeId::of::<burn_cpu::Cpu>() {
-                attention_cpu(q, keys.clone(), values.clone(), Some(mask))
-            } else {
-                attention(q, keys.clone(), values.clone(), Some(mask))
-            }
-            #[cfg(not(feature = "backend-cpu"))]
-            {
-                attention(q, keys.clone(), values.clone(), Some(mask))
-            }
-        };
+        let attended = attention(q, keys.clone(), values.clone(), Some(mask));
         state.keys = Some(keys);
         state.values = Some(values);
 

@@ -1,5 +1,4 @@
 use burn::tensor::activation::silu;
-use crate::modules::linear::apply_linear_2d;
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use burn::module::Param;
@@ -112,9 +111,9 @@ impl<B: Backend + 'static> TimestepEmbedder<B> {
         let freqs = self.freqs.clone().unsqueeze_dim::<2>(0);
         let args = t.mul(freqs);
         let embedding = Tensor::cat(vec![args.clone().cos(), args.sin()], 1);
-        let hidden = apply_linear_2d(&self.proj_in, embedding);
+        let hidden = self.proj_in.forward(embedding);
         let hidden = silu(hidden);
-        let hidden = apply_linear_2d(&self.proj_out, hidden);
+        let hidden = self.proj_out.forward(hidden);
         self.norm.forward(hidden)
     }
 }
@@ -157,7 +156,7 @@ impl<B: Backend + 'static> ResBlock<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 2>, y: Tensor<B, 2>) -> Tensor<B, 2> {
-        let modulation = apply_linear_2d(&self.mod_linear, silu(y));
+        let modulation = self.mod_linear.forward(silu(y));
         let shift = modulation.clone().narrow(1, 0, self.channels);
         let scale = modulation
             .clone()
@@ -165,9 +164,9 @@ impl<B: Backend + 'static> ResBlock<B> {
         let gate = modulation.narrow(1, self.channels * 2, self.channels);
 
         let h = modulate(self.norm.forward(x.clone()), shift, scale);
-        let h = apply_linear_2d(&self.mlp_in, h);
+        let h = self.mlp_in.forward(h);
         let h = silu(h);
-        let h = apply_linear_2d(&self.mlp_out, h);
+        let h = self.mlp_out.forward(h);
         x.add(gate.mul(h))
     }
 }
@@ -212,11 +211,11 @@ impl<B: Backend + 'static> FinalLayer<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 2>, y: Tensor<B, 2>) -> Tensor<B, 2> {
-        let modulation = apply_linear_2d(&self.mod_linear, silu(y));
+        let modulation = self.mod_linear.forward(silu(y));
         let shift = modulation.clone().narrow(1, 0, self.model_channels);
         let scale = modulation.narrow(1, self.model_channels, self.model_channels);
         let x = modulate(self.norm.forward(x), shift, scale);
-        apply_linear_2d(&self.linear, x)
+        self.linear.forward(x)
     }
 }
 
@@ -287,7 +286,7 @@ impl<B: Backend + 'static> SimpleMlpAdaLn<B> {
     }
 
     pub fn forward(&self, c: Tensor<B, 2>, s: Tensor<B, 2>, t: Tensor<B, 2>, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        let mut x = apply_linear_2d(&self.input_proj, x);
+        let mut x = self.input_proj.forward(x);
         let ts = [s, t];
         assert_eq!(ts.len(), self.num_time_conds);
 
@@ -301,7 +300,7 @@ impl<B: Backend + 'static> SimpleMlpAdaLn<B> {
         }
         let t_combined = t_combined.expect("time embeddings missing").div_scalar(self.num_time_conds as f32);
 
-        let cond = apply_linear_2d(&self.cond_embed, c);
+        let cond = self.cond_embed.forward(c);
         let y = t_combined.add(cond);
 
         for block in &self.res_blocks {

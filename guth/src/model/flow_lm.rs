@@ -2,7 +2,7 @@ use crate::conditioner::text::LutConditioner;
 use crate::config::FlowLmConfig;
 use crate::download::download_if_necessary;
 use crate::modules::flow_net::{lsd_decode, SimpleMlpAdaLn};
-use crate::modules::linear::apply_linear_3d as apply_linear_3d_util;
+use crate::modules::linear::apply_linear_3d;
 use crate::modules::transformer::{StreamingTransformer, StreamingTransformerState};
 use crate::state::StreamingModule;
 use burn::tensor::backend::Backend;
@@ -293,10 +293,6 @@ impl<B: Backend + 'static> FlowLmModel<B> {
 
         Ok(())
     }
-}
-
-fn apply_linear_3d<B: Backend + 'static>(linear: &Linear<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
-    apply_linear_3d_util(linear, input)
 }
 
 fn apply_layer_norm_3d<B: Backend>(norm: &LayerNorm<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
@@ -595,8 +591,7 @@ fn out_of_bounds<B: Backend>(noise: Tensor<B, 2>, clamp: f32) -> Tensor<B, 2, Bo
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_linear_3d, make_noise, tensor_f32};
-    use burn_nn::LinearConfig;
+    use super::{make_noise, tensor_f32};
     use burn_ndarray::{NdArray, NdArrayDevice};
     use safetensors::Dtype;
 
@@ -629,12 +624,4 @@ mod tests {
         assert_eq!(decoded, expected);
     }
 
-    #[test]
-    fn apply_linear_3d_empty_sequence_returns_empty() {
-        let device = NdArrayDevice::default();
-        let linear = LinearConfig::new(4, 6).init::<NdArray<f32>>(&device);
-        let input = burn::tensor::Tensor::<NdArray<f32>, 3>::zeros([1, 0, 4], &device);
-        let output = apply_linear_3d(&linear, input);
-        assert_eq!(output.dims(), [1, 0, 6]);
-    }
 }
