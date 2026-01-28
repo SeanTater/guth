@@ -16,8 +16,8 @@ path = "src/main.rs"
 burn = { version = "0.20.1", features = ["ndarray"] }
 burn-nn = "0.20.1"
 burn-ndarray = "0.20.1"
-burn-cpu = { version = "0.20.1", optional = true }
-burn-wgpu = { version = "0.20.1", optional = true }
+burn-cpu = { version = "0.20.1", optional = true, default-features = false, features = ["std"] }
+burn-wgpu = { version = "0.20.1", optional = true, default-features = false, features = ["std", "vulkan"] }
 safetensors = "0.4"
 hf-hub = "0.3"
 sentencepiece = "0.13.1"

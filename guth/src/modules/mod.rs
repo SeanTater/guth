@@ -1,6 +1,7 @@
 pub mod flow_net;
 pub mod dummy_quantizer;
 pub mod layer_scale;
+pub mod linear;
 pub mod mimi_transformer;
 pub mod resample;
 pub mod seanet;

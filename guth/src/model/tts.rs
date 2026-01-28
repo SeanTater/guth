@@ -25,7 +25,7 @@ pub struct TtsModel<B: Backend> {
     pub eos_threshold: f32,
 }
 
-impl<B: Backend> TtsModel<B> {
+impl<B: Backend + 'static> TtsModel<B> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         flow_lm: FlowLmModel<B>,
@@ -178,15 +178,15 @@ impl<B: Backend> TtsModel<B> {
                 }
             }
 
+            backbone_input = latent.clone();
+            latents.push(latent);
+            eos_flags.push(is_eos);
+
             if let Some(eos_step) = eos_step {
                 if step >= eos_step + frames_after_eos {
                     break;
                 }
             }
-
-            backbone_input = latent.clone();
-            latents.push(latent);
-            eos_flags.push(is_eos);
         }
 
         let latents = Tensor::cat(latents, 1);
@@ -286,16 +286,16 @@ impl<B: Backend> TtsModel<B> {
         let device = self.flow_lm.bos_emb.device();
 
         let text_tokens = text_tokens.unwrap_or_else(|| {
-            Tensor::<B, 2, Int>::zeros([1, 0], &device)
+            empty_tensor2_int::<B>(1, 0, &device)
         });
         let backbone_input_latents = backbone_input_latents.unwrap_or_else(|| {
-            Tensor::<B, 3>::zeros([1, 0, self.flow_lm.ldim], &device)
+            empty_tensor3::<B>(1, 0, self.flow_lm.ldim, &device)
         });
         let text_len = text_tokens.dims()[1];
         let backbone_len = backbone_input_latents.dims()[1];
 
         let text_embeddings = if text_len == 0 {
-            Tensor::<B, 3>::zeros([1, 0, self.flow_lm.dim], &device)
+            empty_tensor3::<B>(1, 0, self.flow_lm.dim, &device)
         } else {
             self.flow_lm.conditioner.forward_tokens(text_tokens.clone())
         };
@@ -305,15 +305,12 @@ impl<B: Backend> TtsModel<B> {
             } else {
                 text_embeddings.dims()[2]
             };
-            Tensor::<B, 3>::zeros([1, 0, dim], &device)
+            empty_tensor3::<B>(1, 0, dim, &device)
         });
         let audio_len = audio_conditioning.dims()[1];
         if text_embeddings.dims()[2] != audio_conditioning.dims()[2] {
             if audio_len == 0 {
-                audio_conditioning = Tensor::<B, 3>::zeros(
-                    [1, 0, text_embeddings.dims()[2]],
-                    &device,
-                );
+                audio_conditioning = empty_tensor3::<B>(1, 0, text_embeddings.dims()[2], &device);
             } else {
                 panic!(
                     "Audio conditioning dim {} does not match text embedding dim {}",
@@ -392,6 +389,31 @@ fn tensor2_from_data<B: Backend>(
     Ok(Tensor::from_data(burn::tensor::TensorData::new(values, shape), device))
 }
 
+fn empty_tensor2_int<B: Backend>(batch: usize, len: usize, device: &B::Device) -> Tensor<B, 2, Int> {
+    if len == 0 {
+        let data: Vec<i64> = Vec::new();
+        let td = burn::tensor::TensorData::new(data, [batch, len]);
+        Tensor::from_data(td, device)
+    } else {
+        Tensor::<B, 2, Int>::zeros([batch, len], device)
+    }
+}
+
+fn empty_tensor3<B: Backend>(
+    batch: usize,
+    seq: usize,
+    dim: usize,
+    device: &B::Device,
+) -> Tensor<B, 3> {
+    if seq == 0 {
+        let data: Vec<f32> = Vec::new();
+        let td = burn::tensor::TensorData::new(data, [batch, seq, dim]);
+        Tensor::from_data(td, device)
+    } else {
+        Tensor::<B, 3>::zeros([batch, seq, dim], device)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::tensor2_from_data;
@@ -421,5 +443,14 @@ mod tests {
         let decoded_data = decoded.to_data();
         let decoded_values = decoded_data.as_slice::<f32>().expect("slice");
         assert_eq!(decoded_values, expected.as_slice());
+    }
+
+    #[test]
+    fn empty_tensor_helpers_return_zero_length() {
+        let device = NdArrayDevice::default();
+        let empty2 = super::empty_tensor2_int::<NdArray<f32>>(1, 0, &device);
+        assert_eq!(empty2.dims(), [1, 0]);
+        let empty3 = super::empty_tensor3::<NdArray<f32>>(1, 0, 4, &device);
+        assert_eq!(empty3.dims(), [1, 0, 4]);
     }
 }

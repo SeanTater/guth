@@ -1,4 +1,5 @@
 use crate::modules::layer_scale::{LayerScale, LayerScaleConfig};
+use crate::modules::linear::apply_linear_3d;
 use crate::modules::streaming_mha::{StreamingMha, StreamingMhaConfig, StreamingMhaOp, StreamingMhaState};
 use crate::state::StreamingModule;
 use burn::tensor::activation::gelu;
@@ -53,7 +54,7 @@ pub struct StreamingTransformerLayerState<B: Backend> {
     pub mha: StreamingMhaState<B>,
 }
 
-impl<B: Backend> StreamingTransformerLayer<B> {
+impl<B: Backend + 'static> StreamingTransformerLayer<B> {
     pub fn new(config: StreamingTransformerLayerConfig, device: &B::Device) -> Self {
         let head_dim = config.d_model / config.num_heads;
         let qkv = LinearConfig::new(config.d_model, config.d_model * 3)
@@ -137,21 +138,12 @@ impl<B: Backend> StreamingTransformerLayer<B> {
     }
 
     fn apply_linear(&self, linear: &Linear<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
-        let [batch, seq, dim] = input.dims();
-        if seq == 0 {
-            let out_dim = linear.weight.dims()[1];
-            let device = input.device();
-            return Tensor::zeros([batch, 0, out_dim], &device);
-        }
-        let flat = input.reshape([batch * seq, dim]);
-        let output = linear.forward(flat);
-        let out_dim = output.dims()[1];
-        output.reshape([batch, seq, out_dim])
+        apply_linear_3d(linear, input)
     }
 
     fn apply_layer_norm(&self, norm: &LayerNorm<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
         let [batch, seq, dim] = input.dims();
-        if seq == 0 {
+        if batch == 0 || seq == 0 || dim == 0 {
             return input;
         }
         let flat = input.reshape([batch * seq, dim]);
@@ -186,7 +178,7 @@ impl<B: Backend> StreamingTransformerLayer<B> {
     }
 }
 
-impl<B: Backend> StreamingModule<B> for StreamingTransformerLayer<B> {
+impl<B: Backend + 'static> StreamingModule<B> for StreamingTransformerLayer<B> {
     type State = StreamingTransformerLayerState<B>;
 
     fn init_state(&self, _batch_size: usize, _sequence_length: usize) -> Self::State {
@@ -216,7 +208,7 @@ pub struct StreamingTransformerState<B: Backend> {
     pub layers: Vec<StreamingTransformerLayerState<B>>,
 }
 
-impl<B: Backend> StreamingTransformer<B> {
+impl<B: Backend + 'static> StreamingTransformer<B> {
     pub fn new(config: StreamingTransformerConfig, device: &B::Device) -> Self {
         let mut layers = Vec::with_capacity(config.num_layers);
         for _ in 0..config.num_layers {
@@ -233,7 +225,7 @@ impl<B: Backend> StreamingTransformer<B> {
     }
 }
 
-impl<B: Backend> StreamingModule<B> for StreamingTransformer<B> {
+impl<B: Backend + 'static> StreamingModule<B> for StreamingTransformer<B> {
     type State = StreamingTransformerState<B>;
 
     fn init_state(&self, batch_size: usize, sequence_length: usize) -> Self::State {
@@ -512,6 +504,38 @@ mod tests {
         let input = Tensor::<TestBackend, 3>::zeros([2, 0, 4], &device);
         let output = layer.apply_layer_norm(&layer.norm1, input);
         assert_eq!(output.dims(), [2, 0, 4]);
+    }
+
+    #[test]
+    fn apply_linear_empty_batch_returns_empty() {
+        let device = NdArrayDevice::default();
+        let config = StreamingTransformerLayerConfig {
+            d_model: 4,
+            num_heads: 2,
+            ffn_dim: 8,
+            causal: true,
+            ..Default::default()
+        };
+        let layer = StreamingTransformerLayer::<TestBackend>::new(config, &device);
+        let input = Tensor::<TestBackend, 3>::zeros([0, 1, 4], &device);
+        let output = layer.apply_linear(&layer.ffn_in, input);
+        assert_eq!(output.dims(), [0, 0, 8]);
+    }
+
+    #[test]
+    fn apply_layer_norm_empty_batch_returns_empty() {
+        let device = NdArrayDevice::default();
+        let config = StreamingTransformerLayerConfig {
+            d_model: 4,
+            num_heads: 2,
+            ffn_dim: 8,
+            causal: true,
+            ..Default::default()
+        };
+        let layer = StreamingTransformerLayer::<TestBackend>::new(config, &device);
+        let input = Tensor::<TestBackend, 3>::zeros([0, 1, 4], &device);
+        let output = layer.apply_layer_norm(&layer.norm1, input);
+        assert_eq!(output.dims(), [0, 1, 4]);
     }
 
     #[test]

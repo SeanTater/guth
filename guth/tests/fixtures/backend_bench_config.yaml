@@ -1,0 +1,51 @@
+weights_path: null
+
+flow_lm:
+  dtype: float32
+  flow:
+    depth: 2
+    dim: 16
+  transformer:
+    d_model: 16
+    hidden_scale: 2
+    max_period: 10000
+    num_heads: 2
+    num_layers: 1
+  lookup_table:
+    dim: 16
+    n_bins: 48
+    tokenizer: sentencepiece
+    tokenizer_path: tests/fixtures/tokenizer.model
+
+mimi:
+  dtype: float32
+  sample_rate: 24000
+  channels: 1
+  frame_rate: 12.5
+  seanet:
+    dimension: 16
+    channels: 1
+    n_filters: 16
+    n_residual_layers: 1
+    ratios:
+    - 2
+    - 2
+    kernel_size: 3
+    residual_kernel_size: 3
+    last_kernel_size: 3
+    dilation_base: 2
+    pad_mode: constant
+    compress: 1
+  transformer:
+    d_model: 16
+    num_heads: 1
+    num_layers: 1
+    layer_scale: 0.0
+    context: 8
+    dim_feedforward: 32
+    input_dimension: 16
+    output_dimensions:
+    - 16
+  quantizer:
+    dimension: 16
+    output_dimension: 16

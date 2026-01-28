@@ -2,6 +2,7 @@ use crate::conditioner::text::LutConditioner;
 use crate::config::FlowLmConfig;
 use crate::download::download_if_necessary;
 use crate::modules::flow_net::{lsd_decode, SimpleMlpAdaLn};
+use crate::modules::linear::apply_linear_3d as apply_linear_3d_util;
 use crate::modules::transformer::{StreamingTransformer, StreamingTransformerState};
 use crate::state::StreamingModule;
 use burn::tensor::backend::Backend;
@@ -30,7 +31,7 @@ pub struct FlowLmModel<B: Backend> {
     pub ldim: usize,
 }
 
-impl<B: Backend> FlowLmModel<B> {
+impl<B: Backend + 'static> FlowLmModel<B> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         conditioner: LutConditioner<B>,
@@ -294,17 +295,8 @@ impl<B: Backend> FlowLmModel<B> {
     }
 }
 
-fn apply_linear_3d<B: Backend>(linear: &Linear<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
-    let [batch, seq, dim] = input.dims();
-    if seq == 0 {
-        let out_dim = linear.weight.dims()[1];
-        let device = input.device();
-        return Tensor::<B, 3>::zeros([batch, 0, out_dim], &device);
-    }
-    let flat = input.reshape([batch * seq, dim]);
-    let output = linear.forward(flat);
-    let out_dim = output.dims()[1];
-    output.reshape([batch, seq, out_dim])
+fn apply_linear_3d<B: Backend + 'static>(linear: &Linear<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
+    apply_linear_3d_util(linear, input)
 }
 
 fn apply_layer_norm_3d<B: Backend>(norm: &LayerNorm<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
@@ -603,7 +595,8 @@ fn out_of_bounds<B: Backend>(noise: Tensor<B, 2>, clamp: f32) -> Tensor<B, 2, Bo
 
 #[cfg(test)]
 mod tests {
-    use super::{make_noise, tensor_f32};
+    use super::{apply_linear_3d, make_noise, tensor_f32};
+    use burn_nn::LinearConfig;
     use burn_ndarray::{NdArray, NdArrayDevice};
     use safetensors::Dtype;
 
@@ -634,5 +627,14 @@ mod tests {
         };
         let decoded = tensor_f32(&tensor).expect("decode bf16");
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn apply_linear_3d_empty_sequence_returns_empty() {
+        let device = NdArrayDevice::default();
+        let linear = LinearConfig::new(4, 6).init::<NdArray<f32>>(&device);
+        let input = burn::tensor::Tensor::<NdArray<f32>, 3>::zeros([1, 0, 4], &device);
+        let output = apply_linear_3d(&linear, input);
+        assert_eq!(output.dims(), [1, 0, 6]);
     }
 }
