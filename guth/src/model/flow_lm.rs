@@ -148,14 +148,18 @@ impl<B: Backend> FlowLmModel<B> {
     ) -> (Tensor<B, 2>, Tensor<B, 2, Bool>) {
         let [batch, seq_len, _] = sequence.dims();
         let device = sequence.device();
-        let bos = self
-            .bos_emb
-            .clone()
-            .reshape([1, 1, self.ldim])
-            .repeat_dim(0, batch)
-            .repeat_dim(1, seq_len);
-        let nan_mask = sequence.clone().is_nan();
-        let sequence = sequence.mask_where(nan_mask, bos);
+        let sequence = if seq_len == 0 {
+            sequence
+        } else {
+            let bos = self
+                .bos_emb
+                .clone()
+                .reshape([1, 1, self.ldim])
+                .repeat_dim(0, batch)
+                .repeat_dim(1, seq_len);
+            let nan_mask = sequence.clone().is_nan();
+            sequence.mask_where(nan_mask, bos)
+        };
 
         let input_ = apply_linear_3d(&self.input_linear, sequence.clone());
         let transformer_out = self.backbone(input_, text_embeddings, seq_len, &mut state.transformer);
@@ -208,7 +212,15 @@ impl<B: Backend> FlowLmModel<B> {
         sequence_len: usize,
         state: &mut StreamingTransformerState<B>,
     ) -> Tensor<B, 3> {
-        let combined = Tensor::cat(vec![text_embeddings, input], 1);
+        let text_len = text_embeddings.dims()[1];
+        let input_len = input.dims()[1];
+        let combined = if text_len == 0 {
+            input
+        } else if input_len == 0 {
+            text_embeddings
+        } else {
+            Tensor::cat(vec![text_embeddings, input], 1)
+        };
         let mut output = self.transformer.forward(combined, state);
         output = apply_layer_norm_3d(&self.out_norm, output);
         if sequence_len == 0 {
