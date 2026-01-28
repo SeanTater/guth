@@ -391,3 +391,35 @@ fn tensor2_from_data<B: Backend>(
     }
     Ok(Tensor::from_data(burn::tensor::TensorData::new(values, shape), device))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::tensor2_from_data;
+    use burn::tensor::Tensor;
+    use burn_ndarray::{NdArray, NdArrayDevice};
+    use safetensors::Dtype;
+
+    #[test]
+    fn tensor2_from_data_decodes_bf16() {
+        let values = [1.0_f32, -0.5_f32, 2.25_f32];
+        let mut data = Vec::new();
+        let mut expected = Vec::new();
+        for value in values {
+            let bits = value.to_bits();
+            let bf16 = (bits >> 16) as u16;
+            data.extend_from_slice(&bf16.to_le_bytes());
+            expected.push(f32::from_bits((bf16 as u32) << 16));
+        }
+        let tensor = crate::weights::TensorData {
+            dtype: Dtype::BF16,
+            shape: vec![1, expected.len()],
+            data,
+        };
+        let device = NdArrayDevice::default();
+        let decoded: Tensor<NdArray<f32>, 2> =
+            tensor2_from_data(&tensor, &device).expect("decode bf16");
+        let decoded_data = decoded.to_data();
+        let decoded_values = decoded_data.as_slice::<f32>().expect("slice");
+        assert_eq!(decoded_values, expected.as_slice());
+    }
+}

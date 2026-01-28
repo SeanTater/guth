@@ -518,6 +518,32 @@ fn tensor_f32(tensor: &crate::weights::TensorData) -> anyhow::Result<Vec<f32>> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::tensor_f32;
+    use safetensors::Dtype;
+
+    #[test]
+    fn tensor_f32_decodes_bf16() {
+        let values = [0.25_f32, -1.5_f32, 3.0_f32];
+        let mut data = Vec::new();
+        let mut expected = Vec::new();
+        for value in values {
+            let bits = value.to_bits();
+            let bf16 = (bits >> 16) as u16;
+            data.extend_from_slice(&bf16.to_le_bytes());
+            expected.push(f32::from_bits((bf16 as u32) << 16));
+        }
+        let tensor = crate::weights::TensorData {
+            dtype: Dtype::BF16,
+            shape: vec![expected.len()],
+            data,
+        };
+        let decoded = tensor_f32(&tensor).expect("decode bf16");
+        assert_eq!(decoded, expected);
+    }
+}
+
 fn tensor1_from_data<B: Backend>(
     tensor: &crate::weights::TensorData,
     device: &B::Device,

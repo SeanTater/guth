@@ -591,8 +591,9 @@ fn out_of_bounds<B: Backend>(noise: Tensor<B, 2>, clamp: f32) -> Tensor<B, 2, Bo
 
 #[cfg(test)]
 mod tests {
-    use super::make_noise;
+    use super::{make_noise, tensor_f32};
     use burn_ndarray::{NdArray, NdArrayDevice};
+    use safetensors::Dtype;
 
     #[test]
     fn truncated_noise_respects_clamp() {
@@ -601,5 +602,25 @@ mod tests {
         let data = noise.to_data();
         let values = data.as_slice::<f32>().expect("noise values");
         assert!(values.iter().all(|v| v.abs() <= 0.5 + 1e-6));
+    }
+
+    #[test]
+    fn tensor_f32_decodes_bf16() {
+        let values = [0.0_f32, 1.2345_f32, -2.75_f32];
+        let mut data = Vec::new();
+        let mut expected = Vec::new();
+        for value in values {
+            let bits = value.to_bits();
+            let bf16 = (bits >> 16) as u16;
+            data.extend_from_slice(&bf16.to_le_bytes());
+            expected.push(f32::from_bits((bf16 as u32) << 16));
+        }
+        let tensor = crate::weights::TensorData {
+            dtype: Dtype::BF16,
+            shape: vec![expected.len()],
+            data,
+        };
+        let decoded = tensor_f32(&tensor).expect("decode bf16");
+        assert_eq!(decoded, expected);
     }
 }
