@@ -405,9 +405,6 @@ def main() -> None:
     speaker_proj_weight = torch.empty((dim, ldim), dtype=torch.float32)
     torch.nn.init.uniform_(speaker_proj_weight, a=-0.1, b=0.1)
 
-    text = "Hello."
-    tokens = flow_lm.conditioner.prepare(text).tokens
-
     max_gen_len = 2
     frames_after_eos = 0
     temp = 0.0
@@ -415,55 +412,66 @@ def main() -> None:
     noise_clamp = None
     eos_threshold = 10.0
 
-    sequence_length = tokens.shape[1] + max_gen_len + 1
-    flow_state = init_states(flow_lm, batch_size=1, sequence_length=sequence_length)
+    quantizer_weight = torch.empty((4, 4, 1), dtype=torch.float32)
+    torch.nn.init.uniform_(quantizer_weight, a=-0.2, b=0.2)
+    mimi = build_mimi_from_fixtures(quantizer_weight)
 
-    run_flow_lm_and_increment(
-        flow_lm,
-        flow_state,
-        lsd_decode_steps,
-        temp,
-        noise_clamp,
-        eos_threshold,
-        text_tokens=tokens,
-    )
+    def run_case(text: str, max_len: int):
+        tokens = flow_lm.conditioner.prepare(text).tokens
+        sequence_length = tokens.shape[1] + max_len + 1
+        flow_state = init_states(flow_lm, batch_size=1, sequence_length=sequence_length)
 
-    backbone_input = torch.full(
-        (1, 1, ldim),
-        fill_value=float("nan"),
-        dtype=flow_lm.dtype,
-    )
-    latents = []
-    eos_flags = []
-    for _ in range(max_gen_len):
-        next_latent, is_eos = run_flow_lm_and_increment(
+        run_flow_lm_and_increment(
             flow_lm,
             flow_state,
             lsd_decode_steps,
             temp,
             noise_clamp,
             eos_threshold,
-            backbone_input_latents=backbone_input,
+            text_tokens=tokens,
         )
-        latents.append(next_latent)
-        eos_flags.append(is_eos)
-        backbone_input = next_latent
 
-    quantizer_weight = torch.empty((4, 4, 1), dtype=torch.float32)
-    torch.nn.init.uniform_(quantizer_weight, a=-0.2, b=0.2)
-    mimi = build_mimi_from_fixtures(quantizer_weight)
-    mimi_state = init_states(mimi, batch_size=1, sequence_length=max_gen_len)
+        backbone_input = torch.full(
+            (1, 1, ldim),
+            fill_value=float("nan"),
+            dtype=flow_lm.dtype,
+        )
+        latents = []
+        eos_flags = []
+        for _ in range(max_len):
+            next_latent, is_eos = run_flow_lm_and_increment(
+                flow_lm,
+                flow_state,
+                lsd_decode_steps,
+                temp,
+                noise_clamp,
+                eos_threshold,
+                backbone_input_latents=backbone_input,
+            )
+            latents.append(next_latent)
+            eos_flags.append(is_eos)
+            backbone_input = next_latent
 
-    audio_chunks = []
-    for latent in latents:
-        mimi_decoding_input = latent * flow_lm.emb_std + flow_lm.emb_mean
-        transposed = mimi_decoding_input.transpose(-1, -2)
-        quantized = mimi.quantizer(transposed)
-        audio = mimi.decode_from_latent(quantized, mimi_state)
-        increment_steps(mimi, mimi_state, increment=1)
-        audio_chunks.append(audio)
+        mimi_state = init_states(mimi, batch_size=1, sequence_length=max_len)
+        audio_chunks = []
+        for latent in latents:
+            mimi_decoding_input = latent * flow_lm.emb_std + flow_lm.emb_mean
+            transposed = mimi_decoding_input.transpose(-1, -2)
+            quantized = mimi.quantizer(transposed)
+            audio = mimi.decode_from_latent(quantized, mimi_state)
+            increment_steps(mimi, mimi_state, increment=1)
+            audio_chunks.append(audio)
 
-    audio_full = torch.cat(audio_chunks, dim=2)
+        audio_full = torch.cat(audio_chunks, dim=2)
+        return {
+            "text": text,
+            "tokens": to_list(tokens),
+            "latents": to_list(torch.cat(latents, dim=1)),
+            "eos": to_list(torch.cat(eos_flags, dim=1)),
+            "audio_full": to_list(audio_full),
+        }
+
+    primary_case = run_case("Hello.", max_gen_len)
 
     fixture = {
         "config": {
@@ -488,8 +496,8 @@ def main() -> None:
         },
         "conditioner": {
             "n_bins": n_bins,
-            "text": text,
-            "tokens": to_list(tokens),
+            "text": primary_case["text"],
+            "tokens": primary_case["tokens"],
         },
         "generation": {
             "max_gen_len": max_gen_len,
@@ -500,9 +508,9 @@ def main() -> None:
             "eos_threshold": eos_threshold,
         },
         "mimi_config": mimi_fixture["config"],
-        "latents": to_list(torch.cat(latents, dim=1)),
-        "eos": to_list(torch.cat(eos_flags, dim=1)),
-        "audio_full": to_list(audio_full),
+        "latents": primary_case["latents"],
+        "eos": primary_case["eos"],
+        "audio_full": primary_case["audio_full"],
     }
 
     with (FIXTURES / "tts_model.json").open("w", encoding="utf-8") as f:
@@ -520,6 +528,73 @@ def main() -> None:
     mimi_state["quantizer.weight"] = mimi.quantizer.output_proj.weight
     mimi_state = {key: value.contiguous() for key, value in mimi_state.items()}
     safetensors.torch.save_file(mimi_state, FIXTURES / "tts_mimi_state.safetensors")
+
+    integration_fixture = {
+        "config": fixture["config"],
+        "flow_net": fixture["flow_net"],
+        "conditioner": {
+            "n_bins": n_bins,
+        },
+        "mimi_config": mimi_fixture["config"],
+        "generation": {
+            "max_gen_len": 3,
+            "frames_after_eos": 0,
+            "temp": temp,
+            "lsd_decode_steps": lsd_decode_steps,
+            "noise_clamp": noise_clamp,
+            "eos_threshold": eos_threshold,
+        },
+        "cases": [
+            run_case("Hi.", 3),
+            run_case("Hello there.", 3),
+            run_case("This is a longer sentence for integration tests.", 3),
+        ],
+    }
+    with (FIXTURES / "tts_integration.json").open("w", encoding="utf-8") as f:
+        json.dump(integration_fixture, f, indent=2)
+
+    tts_state = {}
+    for key, value in flow_state.items():
+        tts_state[f"flow_lm.{key}"] = value
+    for key, value in mimi_state.items():
+        tts_state[f"mimi.{key}"] = value
+    safetensors.torch.save_file(tts_state, FIXTURES / "tts_state.safetensors")
+
+    seanet_config = load_fixture("seanet_encoder.json")["config"]
+    config = {
+        "weights_path": "tests/fixtures/tts_state.safetensors",
+        "flow_lm": {
+            "dtype": "float32",
+            "flow": {"depth": 2, "dim": 4},
+            "transformer": {
+                "hidden_scale": 2,
+                "max_period": 10000,
+                "d_model": 4,
+                "num_heads": 2,
+                "num_layers": 1,
+            },
+            "lookup_table": {
+                "dim": 4,
+                "n_bins": n_bins,
+                "tokenizer": "sentencepiece",
+                "tokenizer_path": "tests/fixtures/tokenizer.model",
+            },
+        },
+        "mimi": {
+            "dtype": "float32",
+            "sample_rate": mimi_fixture["config"]["sample_rate"],
+            "channels": mimi_fixture["config"]["channels"],
+            "frame_rate": mimi_fixture["config"]["frame_rate"],
+            "seanet": seanet_config,
+            "transformer": mimi_fixture["config"]["transformer"],
+            "quantizer": {
+                "dimension": 4,
+                "output_dimension": 4,
+            },
+        },
+    }
+    with (FIXTURES / "tts_integration_config.yaml").open("w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,61 @@
+{
+  "weights_path": "tests/fixtures/tts_state.safetensors",
+  "flow_lm": {
+    "dtype": "float32",
+    "flow": {
+      "depth": 2,
+      "dim": 4
+    },
+    "transformer": {
+      "hidden_scale": 2,
+      "max_period": 10000,
+      "d_model": 4,
+      "num_heads": 2,
+      "num_layers": 1
+    },
+    "lookup_table": {
+      "dim": 4,
+      "n_bins": 48,
+      "tokenizer": "sentencepiece",
+      "tokenizer_path": "tests/fixtures/tokenizer.model"
+    }
+  },
+  "mimi": {
+    "dtype": "float32",
+    "sample_rate": 8,
+    "channels": 1,
+    "frame_rate": 2.0,
+    "seanet": {
+      "channels": 1,
+      "dimension": 4,
+      "n_filters": 2,
+      "n_residual_layers": 1,
+      "ratios": [
+        2
+      ],
+      "kernel_size": 3,
+      "last_kernel_size": 3,
+      "residual_kernel_size": 3,
+      "dilation_base": 2,
+      "pad_mode": "constant",
+      "compress": 2
+    },
+    "transformer": {
+      "input_dimension": 4,
+      "output_dimensions": [
+        4
+      ],
+      "d_model": 8,
+      "num_heads": 2,
+      "num_layers": 1,
+      "layer_scale": 0.1,
+      "context": 4,
+      "max_period": 10000.0,
+      "dim_feedforward": 16
+    },
+    "quantizer": {
+      "dimension": 4,
+      "output_dimension": 4
+    }
+  }
+}
