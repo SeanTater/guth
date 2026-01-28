@@ -9,6 +9,8 @@ use guth::conditioner::text::TextTokenizer;
 use burn::tensor::{Int, Tensor, TensorData};
 use burn_ndarray::{NdArray, NdArrayDevice};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::collections::HashMap;
 use safetensors::Dtype;
 
@@ -112,6 +114,11 @@ fn main() -> Result<()> {
             if voice.is_some() {
                 anyhow::bail!("Predefined voices are not wired yet; use --voice-file for now.");
             }
+            let interrupted = Arc::new(AtomicBool::new(false));
+            let interrupt_flag = Arc::clone(&interrupted);
+            ctrlc::set_handler(move || {
+                interrupt_flag.store(true, Ordering::SeqCst);
+            })?;
             let config_path = resolve_config_path(config);
             let cfg = load_config(&config_path)?;
             let device = NdArrayDevice::default();
@@ -165,6 +172,10 @@ fn main() -> Result<()> {
                 )?;
                 let mut chunk_idx = 0usize;
                 for chunk in receiver {
+                    if interrupted.load(Ordering::SeqCst) {
+                        writer.finalize()?;
+                        anyhow::bail!("Interrupted");
+                    }
                     let audio_vec = audio_to_vec(chunk);
                     writer.write_chunk(&audio_vec)?;
                     if progress {
@@ -180,6 +191,9 @@ fn main() -> Result<()> {
                     max_gen_len,
                     frames_after_eos,
                 );
+                if interrupted.load(Ordering::SeqCst) {
+                    anyhow::bail!("Interrupted");
+                }
                 let audio_vec = audio_to_vec(audio);
                 WavIo::write_wav(output_path, &audio_vec, cfg.mimi.sample_rate as u32)?;
             }
