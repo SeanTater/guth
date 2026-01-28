@@ -144,7 +144,7 @@ fn main() -> Result<()> {
             let mut state = tts.init_state(1, tokens.dims()[1] + max_gen_len + 1, max_gen_len, &device);
 
             if let Some(voice_path) = voice_file {
-                let (samples, sample_rate) = WavIo::read_wav(&voice_path)?;
+                let (samples, sample_rate) = WavIo::read_audio(&voice_path)?;
                 let prompt = AudioResampler::convert_audio(
                     samples,
                     sample_rate,
@@ -201,7 +201,7 @@ fn main() -> Result<()> {
                     0.0,
                     &device,
                 )?;
-                let (samples, sample_rate) = WavIo::read_wav(input)?;
+                let (samples, sample_rate) = WavIo::read_audio(input)?;
                 let prompt = AudioResampler::convert_audio(
                     samples,
                     sample_rate,
@@ -228,7 +228,7 @@ fn main() -> Result<()> {
                 to_rate,
                 to_channels,
             } => {
-                let (samples, sample_rate) = WavIo::read_wav(input)?;
+                let (samples, sample_rate) = WavIo::read_audio(input)?;
                 let converted = AudioResampler::convert_audio(
                     samples,
                     sample_rate,

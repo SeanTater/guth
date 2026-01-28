@@ -5,6 +5,8 @@ from typing import Any, Iterable
 
 import torch
 import safetensors.torch
+import soundfile as sf
+from scipy.signal import resample_poly
 
 from pocket_tts.conditioners.base import TokenizedText
 from pocket_tts.conditioners.text import LUTConditioner
@@ -529,6 +531,83 @@ def main() -> None:
     mimi_state = {key: value.contiguous() for key, value in mimi_state.items()}
     safetensors.torch.save_file(mimi_state, FIXTURES / "tts_mimi_state.safetensors")
 
+    voice_path = FIXTURES / "voices" / "sean.ogg"
+    voice_audio, voice_rate = sf.read(str(voice_path), dtype="float32")
+    if voice_audio.ndim == 1:
+        voice_audio = voice_audio[None, :]
+    else:
+        voice_audio = voice_audio.mean(axis=1, keepdims=True).T
+    voice_audio_raw = voice_audio.copy()
+    if voice_rate != 24000:
+        gcd = math.gcd(voice_rate, 24000)
+        up = 24000 // gcd
+        down = voice_rate // gcd
+        voice_audio = resample_poly(voice_audio, up, down, axis=-1)
+    voice_audio = torch.from_numpy(voice_audio).to(dtype=flow_lm.dtype)
+    voice_audio = voice_audio[:, :2400]
+    voice_audio = voice_audio.unsqueeze(0)
+
+    voice_latents = mimi.encode_to_latent(voice_audio)
+    voice_conditioning = voice_latents.transpose(-1, -2).to(torch.float32)
+    voice_conditioning = torch.nn.functional.linear(
+        voice_conditioning, speaker_proj_weight
+    )
+
+    voice_tokens = flow_lm.conditioner.prepare("Voice prompt test.").tokens
+    voice_sequence_length = (
+        voice_tokens.shape[1] + 3 + voice_conditioning.shape[1] + 1
+    )
+    voice_state = init_states(flow_lm, batch_size=1, sequence_length=voice_sequence_length)
+    run_flow_lm_and_increment(
+        flow_lm,
+        voice_state,
+        lsd_decode_steps,
+        temp,
+        noise_clamp,
+        eos_threshold,
+        audio_conditioning=voice_conditioning,
+    )
+    run_flow_lm_and_increment(
+        flow_lm,
+        voice_state,
+        lsd_decode_steps,
+        temp,
+        noise_clamp,
+        eos_threshold,
+        text_tokens=voice_tokens,
+    )
+    backbone_input = torch.full(
+        (1, 1, ldim),
+        fill_value=float("nan"),
+        dtype=flow_lm.dtype,
+    )
+    voice_latents_out = []
+    voice_eos = []
+    for _ in range(3):
+        next_latent, is_eos = run_flow_lm_and_increment(
+            flow_lm,
+            voice_state,
+            lsd_decode_steps,
+            temp,
+            noise_clamp,
+            eos_threshold,
+            backbone_input_latents=backbone_input,
+        )
+        voice_latents_out.append(next_latent)
+        voice_eos.append(is_eos)
+        backbone_input = next_latent
+
+    voice_mimi_state = init_states(mimi, batch_size=1, sequence_length=3)
+    voice_audio_chunks = []
+    for latent in voice_latents_out:
+        mimi_decoding_input = latent * flow_lm.emb_std + flow_lm.emb_mean
+        transposed = mimi_decoding_input.transpose(-1, -2)
+        quantized = mimi.quantizer(transposed)
+        audio = mimi.decode_from_latent(quantized, voice_mimi_state)
+        increment_steps(mimi, voice_mimi_state, increment=1)
+        voice_audio_chunks.append(audio)
+    voice_audio_full = torch.cat(voice_audio_chunks, dim=2)
+
     integration_fixture = {
         "config": fixture["config"],
         "flow_net": fixture["flow_net"],
@@ -549,9 +628,25 @@ def main() -> None:
             run_case("Hello there.", 3),
             run_case("This is a longer sentence for integration tests.", 3),
         ],
+        "voice_case": {
+            "text": "Voice prompt test.",
+            "tokens": to_list(voice_tokens),
+            "audio_prompt": to_list(voice_audio.squeeze(0)),
+            "latents": to_list(torch.cat(voice_latents_out, dim=1)),
+            "eos": to_list(torch.cat(voice_eos, dim=1)),
+            "audio_full": to_list(voice_audio_full),
+        },
     }
     with (FIXTURES / "tts_integration.json").open("w", encoding="utf-8") as f:
         json.dump(integration_fixture, f, indent=2)
+
+    ogg_fixture = {
+        "sample_rate": voice_rate,
+        "channels": 1,
+        "samples": voice_audio_raw.squeeze(0)[:128].tolist(),
+    }
+    with (FIXTURES / "voice_ogg_fixture.json").open("w", encoding="utf-8") as f:
+        json.dump(ogg_fixture, f, indent=2)
 
     tts_state = {}
     for key, value in flow_state.items():

@@ -1,13 +1,23 @@
 use anyhow::Result;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufReader, BufWriter};
 use std::path::Path;
 
 #[derive(Debug, Default)]
 pub struct WavIo;
 
 impl WavIo {
+    pub fn read_audio(path: impl AsRef<Path>) -> Result<(Vec<Vec<f32>>, u32)> {
+        let path = path.as_ref();
+        match path.extension().and_then(|ext| ext.to_str()).map(|s| s.to_lowercase()) {
+            Some(ext) if ext == "wav" => Self::read_wav(path),
+            Some(ext) if ext == "ogg" || ext == "oga" => Self::read_ogg(path),
+            Some(ext) => anyhow::bail!("Unsupported audio extension: {ext}"),
+            None => anyhow::bail!("Audio path has no extension"),
+        }
+    }
+
     pub fn read_wav(path: impl AsRef<Path>) -> Result<(Vec<Vec<f32>>, u32)> {
         let mut reader = WavReader::open(path)?;
         let spec = reader.spec();
@@ -28,6 +38,23 @@ impl WavIo {
                     let value = sample? as f32 / max;
                     samples[idx % channels].push(value);
                 }
+            }
+        }
+
+        Ok((samples, sample_rate))
+    }
+
+    pub fn read_ogg(path: impl AsRef<Path>) -> Result<(Vec<Vec<f32>>, u32)> {
+        let file = File::open(path)?;
+        let mut reader = lewton::inside_ogg::OggStreamReader::new(BufReader::new(file))?;
+        let sample_rate = reader.ident_hdr.audio_sample_rate;
+        let channels = reader.ident_hdr.audio_channels as usize;
+        let mut samples = vec![Vec::new(); channels];
+
+        while let Some(packet) = reader.read_dec_packet_itl()? {
+            for (idx, sample) in packet.iter().enumerate() {
+                let value = *sample as f32 / 32768.0;
+                samples[idx % channels].push(value);
             }
         }
 
