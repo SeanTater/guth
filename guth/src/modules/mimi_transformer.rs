@@ -1,5 +1,5 @@
 use crate::modules::layer_scale::{LayerScale, LayerScaleConfig};
-use crate::modules::linear::apply_linear_3d as apply_linear;
+use crate::modules::linear::{apply_layer_norm_3d as apply_layer_norm, apply_linear_3d as apply_linear};
 use burn::tensor::activation::gelu;
 use burn::tensor::backend::Backend;
 use burn::tensor::module::attention;
@@ -78,13 +78,6 @@ pub struct MimiProjectedTransformer<B: Backend> {
     pub input_proj: Option<Linear<B>>,
     pub output_projs: Vec<ProjectedOutput<B>>,
     pub transformer: MimiTransformer<B>,
-}
-
-fn apply_layer_norm<B: Backend>(norm: &LayerNorm<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
-    let [batch, seq, dim] = input.dims();
-    let flat = input.reshape([batch * seq, dim]);
-    let output = norm.forward(flat);
-    output.reshape([batch, seq, dim])
 }
 
 fn positions_from_offset<B: Backend>(

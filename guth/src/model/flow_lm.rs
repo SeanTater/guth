@@ -2,7 +2,7 @@ use crate::conditioner::text::LutConditioner;
 use crate::config::FlowLmConfig;
 use crate::download::download_if_necessary;
 use crate::modules::flow_net::{lsd_decode, SimpleMlpAdaLn};
-use crate::modules::linear::apply_linear_3d;
+use crate::modules::linear::{apply_layer_norm_3d, apply_linear_3d};
 use crate::modules::transformer::{StreamingTransformer, StreamingTransformerState};
 use crate::state::StreamingModule;
 use burn::tensor::backend::Backend;
@@ -293,16 +293,6 @@ impl<B: Backend + 'static> FlowLmModel<B> {
 
         Ok(())
     }
-}
-
-fn apply_layer_norm_3d<B: Backend>(norm: &LayerNorm<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
-    let [batch, seq, dim] = input.dims();
-    if seq == 0 {
-        return input;
-    }
-    let flat = input.reshape([batch * seq, dim]);
-    let output = norm.forward(flat);
-    output.reshape([batch, seq, dim])
 }
 
 fn tensor_f32(tensor: &crate::weights::TensorData) -> anyhow::Result<Vec<f32>> {

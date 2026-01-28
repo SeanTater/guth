@@ -1,5 +1,5 @@
 use crate::modules::layer_scale::{LayerScale, LayerScaleConfig};
-use crate::modules::linear::apply_linear_3d;
+use crate::modules::linear::{apply_layer_norm_3d, apply_linear_3d};
 use crate::modules::streaming_mha::{StreamingMha, StreamingMhaConfig, StreamingMhaOp, StreamingMhaState};
 use crate::state::StreamingModule;
 use burn::tensor::activation::gelu;
@@ -107,7 +107,7 @@ impl<B: Backend + 'static> StreamingTransformerLayer<B> {
 
     pub fn forward(&self, input: Tensor<B, 3>, state: &mut StreamingTransformerLayerState<B>) -> Tensor<B, 3> {
         let residual = input.clone();
-        let normalized = self.apply_layer_norm(&self.norm1, input);
+        let normalized = apply_layer_norm_3d(&self.norm1, input);
         let qkv = self.apply_linear(&self.qkv, normalized);
         let (queries, keys, values) = self.split_qkv(qkv);
 
@@ -125,7 +125,7 @@ impl<B: Backend + 'static> StreamingTransformerLayer<B> {
         };
         let hidden = residual.add(attn);
 
-        let ffn_input = self.apply_layer_norm(&self.norm2, hidden.clone());
+        let ffn_input = apply_layer_norm_3d(&self.norm2, hidden.clone());
         let ffn = self.apply_linear(&self.ffn_in, ffn_input);
         let ffn = gelu(ffn);
         let ffn = self.apply_linear(&self.ffn_out, ffn);
@@ -139,16 +139,6 @@ impl<B: Backend + 'static> StreamingTransformerLayer<B> {
 
     fn apply_linear(&self, linear: &Linear<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
         apply_linear_3d(linear, input)
-    }
-
-    fn apply_layer_norm(&self, norm: &LayerNorm<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
-        let [batch, seq, dim] = input.dims();
-        if batch == 0 || seq == 0 || dim == 0 {
-            return input;
-        }
-        let flat = input.reshape([batch * seq, dim]);
-        let output = norm.forward(flat);
-        output.reshape([batch, seq, dim])
     }
 
     fn split_qkv(&self, qkv: Tensor<B, 3>) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {

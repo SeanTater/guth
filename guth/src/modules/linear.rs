@@ -1,6 +1,6 @@
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
-use burn_nn::Linear;
+use burn_nn::{LayerNorm, Linear};
 
 /// Applies a linear layer to a 3D tensor.
 ///
@@ -26,4 +26,21 @@ pub fn apply_linear_3d<B: Backend>(linear: &Linear<B>, input: Tensor<B, 3>) -> T
         );
     }
     linear.forward(input)
+}
+
+/// Applies layer normalization to a 3D tensor.
+///
+/// Burn's `LayerNorm::forward` natively supports tensors of any rank, so in
+/// principle we could just call `norm.forward(input)`. However, `burn-ndarray`
+/// 0.20.1 has issues with zero-length dimensions in various operations.
+///
+/// This helper returns the input unchanged if any dimension is zero (nothing
+/// to normalize, and avoids potential panics). Once the upstream bugs are
+/// fixed, this function can be replaced with a direct `norm.forward(input)` call.
+pub fn apply_layer_norm_3d<B: Backend>(norm: &LayerNorm<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
+    let [batch, seq, dim] = input.dims();
+    if batch == 0 || seq == 0 || dim == 0 {
+        return input;
+    }
+    norm.forward(input)
 }
