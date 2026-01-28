@@ -1,7 +1,10 @@
+mod common;
+
 use burn::tensor::{Tensor, TensorData};
-use burn_ndarray::{NdArray, NdArrayDevice};
+use burn_ndarray::NdArrayDevice;
 use serde::Deserialize;
 
+use common::{assert_close, read_fixture, tensor3, TestBackend};
 use guth::model::mimi::MimiModel;
 use guth::modules::dummy_quantizer::DummyQuantizer;
 use guth::modules::mimi_transformer::{
@@ -12,9 +15,6 @@ use guth::modules::streaming_conv::{
     PaddingMode, StreamingConv1dOp, StreamingConvConfig, StreamingConvTranspose1dOp,
 };
 use guth::weights::load_mimi_state_dict;
-
-const FIXTURE_DIR: &str = "tests/fixtures";
-type TestBackend = NdArray<f32>;
 
 #[derive(Deserialize)]
 struct DummyQuantizerFixture {
@@ -94,39 +94,6 @@ struct ConvConfigFixture {
     dilation: usize,
     padding: usize,
     pad_mode: Option<String>,
-}
-
-fn read_fixture<T: for<'de> Deserialize<'de>>(name: &str) -> T {
-    let path = format!("{FIXTURE_DIR}/{name}");
-    let data = std::fs::read_to_string(path).expect("fixture read");
-    serde_json::from_str(&data).expect("fixture parse")
-}
-
-fn tensor3_from_nested(data: Vec<Vec<Vec<f32>>>, device: &NdArrayDevice) -> Tensor<TestBackend, 3> {
-    let b = data.len();
-    let c = data[0].len();
-    let t = data[0][0].len();
-    let mut flat = Vec::with_capacity(b * c * t);
-    for bb in data {
-        for cc in bb {
-            for val in cc {
-                flat.push(val);
-            }
-        }
-    }
-    let td = TensorData::new(flat, vec![b, c, t]);
-    Tensor::from_data(td, device)
-}
-
-fn assert_close(a: &TensorData, b: &TensorData, tol: f32) {
-    let a_slice = a.as_slice::<f32>().expect("a slice");
-    let b_slice = b.as_slice::<f32>().expect("b slice");
-    assert_eq!(a_slice.len(), b_slice.len());
-    for (idx, (x, y)) in a_slice.iter().zip(b_slice.iter()).enumerate() {
-        if (x - y).abs() > tol {
-            panic!("mismatch at {idx}: {x} vs {y}");
-        }
-    }
 }
 
 fn build_conv(config: &ConvConfigFixture, weight: Vec<Vec<Vec<f32>>>, bias: Vec<f32>, device: &NdArrayDevice) -> StreamingConv1dOp<TestBackend> {
@@ -297,9 +264,9 @@ fn dummy_quantizer_matches_fixture() {
     let weight_data = state.get("quantizer.weight").expect("quantizer weight");
     let weight = tensor3_from_state_data(weight_data, &device);
     let quantizer = DummyQuantizer::new(weight);
-    let input = tensor3_from_nested(fixture.input, &device);
+    let input = tensor3(fixture.input, &device);
     let output = quantizer.forward(input).to_data();
-    let expected = tensor3_from_nested(fixture.output, &device).to_data();
+    let expected = tensor3(fixture.output, &device).to_data();
     assert_close(&output, &expected, 1e-4);
 }
 
@@ -310,15 +277,15 @@ fn mimi_encode_decode_matches_fixture() {
 
     let mimi = build_mimi(&fixture, &device);
 
-    let audio_input = tensor3_from_nested(fixture.audio_input, &device);
+    let audio_input = tensor3(fixture.audio_input, &device);
     let latent_output = mimi.encode_to_latent(audio_input).to_data();
-    let expected_latent = tensor3_from_nested(fixture.latent_output, &device).to_data();
+    let expected_latent = tensor3(fixture.latent_output, &device).to_data();
     assert_close(&latent_output, &expected_latent, 1e-4);
 
-    let latent_input = tensor3_from_nested(fixture.latent_input, &device);
+    let latent_input = tensor3(fixture.latent_input, &device);
     let mut state = mimi.init_state(1, latent_input.dims()[2], &device);
     let audio_output = mimi.decode_from_latent(latent_input, &mut state).to_data();
-    let expected_audio = tensor3_from_nested(fixture.audio_output, &device).to_data();
+    let expected_audio = tensor3(fixture.audio_output, &device).to_data();
     assert_close(&audio_output, &expected_audio, 1e-4);
 }
 
@@ -329,7 +296,7 @@ fn mimi_streaming_decode_matches_batch() {
 
     let mimi = build_mimi(&fixture, &device);
 
-    let latent_input = tensor3_from_nested(fixture.latent_input, &device);
+    let latent_input = tensor3(fixture.latent_input, &device);
     let mut batch_state = mimi.init_state(1, latent_input.dims()[2], &device);
     let batch_audio = mimi.decode_from_latent(latent_input.clone(), &mut batch_state);
 
@@ -357,7 +324,7 @@ fn mimi_streaming_decode_unaligned_chunks_matches_batch() {
 
     let mimi = build_mimi(&fixture, &device);
 
-    let latent_input = tensor3_from_nested(fixture.latent_input, &device);
+    let latent_input = tensor3(fixture.latent_input, &device);
     let mut batch_state = mimi.init_state(1, latent_input.dims()[2], &device);
     let batch_audio = mimi.decode_from_latent(latent_input.clone(), &mut batch_state);
 
@@ -388,7 +355,7 @@ fn mimi_transformer_streaming_matches_batch() {
 
     let mimi = build_mimi(&fixture, &device);
     let transformer = mimi.decoder_transformer;
-    let input = tensor3_from_nested(fixture.latent_input, &device);
+    let input = tensor3(fixture.latent_input, &device);
 
     let mut batch_state = transformer.init_state(1, &device);
     let batch_output = transformer.forward(input.clone(), &mut batch_state).remove(0);

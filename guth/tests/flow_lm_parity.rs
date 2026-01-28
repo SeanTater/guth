@@ -1,18 +1,19 @@
-use burn::tensor::{Bool, Int, Tensor, TensorData, Tolerance};
-use burn_ndarray::{NdArray, NdArrayDevice};
+mod common;
+
+use burn::tensor::{Tensor, Tolerance};
+use burn_ndarray::NdArrayDevice;
 use serde::Deserialize;
 
+use common::{read_fixture, tensor2, tensor2_int, tensor3, tensor3_bool, TestBackend};
 use guth::conditioner::text::LutConditioner;
 use guth::model::flow_lm::{FlowLmModel, FlowLmState};
 use guth::modules::flow_net::{SimpleMlpAdaLn, SimpleMlpAdaLnConfig};
+use guth::modules::linear::{apply_layer_norm_3d, apply_linear_3d};
 use guth::modules::transformer::{
     StreamingTransformer, StreamingTransformerConfig, StreamingTransformerLayerConfig,
 };
 use guth::state::StreamingModule;
 use guth::weights::load_flow_lm_state_dict;
-
-const FIXTURE_DIR: &str = "tests/fixtures";
-type TestBackend = NdArray<f32>;
 
 #[derive(Debug, Deserialize)]
 struct FlowLmFixture {
@@ -62,81 +63,6 @@ struct FlowNetConfig {
     num_time_conds: usize,
     frequency_embedding_size: usize,
     max_period: f32,
-}
-
-fn read_fixture<T: for<'de> Deserialize<'de>>(name: &str) -> T {
-    let path = format!("{FIXTURE_DIR}/{name}");
-    let data = std::fs::read_to_string(path).expect("fixture read");
-    serde_json::from_str(&data).expect("fixture parse")
-}
-
-fn tensor2(device: &NdArrayDevice, data: Vec<Vec<f32>>) -> Tensor<TestBackend, 2> {
-    let rows = data.len();
-    let cols = data.first().map(|row| row.len()).unwrap_or(0);
-    let flat: Vec<f32> = data.into_iter().flatten().collect();
-    let td = TensorData::new(flat, [rows, cols]);
-    Tensor::from_data(td, device)
-}
-
-fn tensor2_int(device: &NdArrayDevice, data: Vec<Vec<i64>>) -> Tensor<TestBackend, 2, Int> {
-    let rows = data.len();
-    let cols = data.first().map(|row| row.len()).unwrap_or(0);
-    let flat: Vec<i64> = data.into_iter().flatten().collect();
-    let td = TensorData::new(flat, [rows, cols]);
-    Tensor::from_data(td, device)
-}
-
-fn tensor3(device: &NdArrayDevice, data: Vec<Vec<Vec<f32>>>) -> Tensor<TestBackend, 3> {
-    let b = data.len();
-    let c = data[0].len();
-    let t = data[0][0].len();
-    let mut flat = Vec::with_capacity(b * c * t);
-    for bb in data {
-        for cc in bb {
-            for val in cc {
-                flat.push(val);
-            }
-        }
-    }
-    let td = TensorData::new(flat, [b, c, t]);
-    Tensor::from_data(td, device)
-}
-
-fn tensor3_bool(device: &NdArrayDevice, data: Vec<Vec<Vec<bool>>>) -> Tensor<TestBackend, 3, Bool> {
-    let b = data.len();
-    let c = data[0].len();
-    let t = data[0][0].len();
-    let mut flat = Vec::with_capacity(b * c * t);
-    for bb in data {
-        for cc in bb {
-            for val in cc {
-                flat.push(val);
-            }
-        }
-    }
-    let td = TensorData::new(flat, [b, c, t]);
-    Tensor::from_data(td, device)
-}
-
-fn linear_3d(
-    linear: &burn_nn::Linear<TestBackend>,
-    input: Tensor<TestBackend, 3>,
-) -> Tensor<TestBackend, 3> {
-    let [batch, seq, dim] = input.dims();
-    let flat = input.reshape([batch * seq, dim]);
-    let output = linear.forward(flat);
-    let out_dim = output.dims()[1];
-    output.reshape([batch, seq, out_dim])
-}
-
-fn norm_3d(
-    norm: &burn_nn::LayerNorm<TestBackend>,
-    input: Tensor<TestBackend, 3>,
-) -> Tensor<TestBackend, 3> {
-    let [batch, seq, dim] = input.dims();
-    let flat = input.reshape([batch * seq, dim]);
-    let output = norm.forward(flat);
-    output.reshape([batch, seq, dim])
 }
 
 fn build_flow_net(device: &NdArrayDevice) -> SimpleMlpAdaLn<TestBackend> {
@@ -217,15 +143,15 @@ fn flow_lm_matches_fixture() {
         .load_state_dict(&state, &device)
         .expect("apply flow lm state dict");
 
-    let tokens = tensor2_int(&device, fixture.conditioner.tokens);
+    let tokens = tensor2_int(fixture.conditioner.tokens, &device);
     let text_embeddings = model.conditioner.forward_tokens(tokens);
     text_embeddings.to_data().assert_approx_eq(
-        &tensor3(&device, fixture.conditioner.text_embeddings).to_data(),
+        &tensor3(fixture.conditioner.text_embeddings, &device).to_data(),
         Tolerance::<f32>::absolute(1e-4).set_relative(1e-4),
     );
 
-    let sequence_clean = tensor3(&device, fixture.sequence);
-    let nan_mask = tensor3_bool(&device, fixture.sequence_nan_mask);
+    let sequence_clean = tensor3(fixture.sequence, &device);
+    let nan_mask = tensor3_bool(fixture.sequence_nan_mask, &device);
     let nan_fill = Tensor::<TestBackend, 3>::full(sequence_clean.dims(), f32::NAN, &device);
     let sequence = sequence_clean.mask_where(nan_mask.clone(), nan_fill);
     let mut state = FlowLmState {
@@ -241,15 +167,15 @@ fn flow_lm_matches_fixture() {
         .repeat_dim(0, 1)
         .repeat_dim(1, sequence.dims()[1]);
     let sequence_with_bos = sequence.clone().mask_where(nan_mask, bos);
-    let input_linear_out = linear_3d(&model.input_linear, sequence_with_bos);
+    let input_linear_out = apply_linear_3d(&model.input_linear, sequence_with_bos);
     input_linear_out.to_data().assert_approx_eq(
-        &tensor3(&device, fixture.input_linear).to_data(),
+        &tensor3(fixture.input_linear, &device).to_data(),
         Tolerance::<f32>::absolute(1e-4).set_relative(1e-4),
     );
 
     let transformer_input = Tensor::cat(vec![text_embeddings.clone(), input_linear_out], 1);
     transformer_input.to_data().assert_approx_eq(
-        &tensor3(&device, fixture.transformer_input).to_data(),
+        &tensor3(fixture.transformer_input, &device).to_data(),
         Tolerance::<f32>::absolute(1e-4).set_relative(1e-4),
     );
 
@@ -258,13 +184,13 @@ fn flow_lm_matches_fixture() {
         .init_state(1, transformer_input.dims()[1]);
     let transformer_raw = model.transformer.forward(transformer_input, &mut transformer_state);
     transformer_raw.to_data().assert_approx_eq(
-        &tensor3(&device, fixture.transformer_raw).to_data(),
+        &tensor3(fixture.transformer_raw, &device).to_data(),
         Tolerance::<f32>::absolute(1e-4).set_relative(1e-4),
     );
 
-    let transformer_normed = norm_3d(&model.out_norm, transformer_raw);
+    let transformer_normed = apply_layer_norm_3d(&model.out_norm, transformer_raw);
     transformer_normed.to_data().assert_approx_eq(
-        &tensor3(&device, fixture.transformer_normed).to_data(),
+        &tensor3(fixture.transformer_normed, &device).to_data(),
         Tolerance::<f32>::absolute(1e-4).set_relative(1e-4),
     );
 
@@ -272,7 +198,7 @@ fn flow_lm_matches_fixture() {
     let transformer_trimmed =
         transformer_normed.narrow(1, total_len - sequence.dims()[1], sequence.dims()[1]);
     transformer_trimmed.to_data().assert_approx_eq(
-        &tensor3(&device, fixture.transformer_trimmed).to_data(),
+        &tensor3(fixture.transformer_trimmed, &device).to_data(),
         Tolerance::<f32>::absolute(1e-4).set_relative(1e-4),
     );
 
@@ -280,14 +206,14 @@ fn flow_lm_matches_fixture() {
         .narrow(1, sequence.dims()[1] - 1, 1)
         .reshape([1, fixture.config.dim]);
     transformer_last.to_data().assert_approx_eq(
-        &tensor2(&device, fixture.transformer_last).to_data(),
+        &tensor2(fixture.transformer_last, &device).to_data(),
         Tolerance::<f32>::absolute(1e-4).set_relative(1e-4),
     );
 
     let (latent, eos) = model.forward(sequence, text_embeddings, &mut state, 2, 0.0, None, 0.0);
 
     latent.to_data().assert_approx_eq(
-        &tensor2(&device, fixture.latent).to_data(),
+        &tensor2(fixture.latent, &device).to_data(),
         Tolerance::<f32>::absolute(1e-4).set_relative(1e-4),
     );
 

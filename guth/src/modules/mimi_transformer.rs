@@ -1,5 +1,8 @@
 use crate::modules::layer_scale::{LayerScale, LayerScaleConfig};
-use crate::modules::linear::{apply_layer_norm_3d as apply_layer_norm, apply_linear_3d as apply_linear};
+use crate::modules::linear::{
+    apply_layer_norm_3d as apply_layer_norm, apply_linear_3d as apply_linear, merge_heads,
+    split_qkv,
+};
 use burn::tensor::activation::gelu;
 use burn::tensor::backend::Backend;
 use burn::tensor::module::attention;
@@ -158,23 +161,8 @@ impl<B: Backend + 'static> MimiSelfAttention<B> {
     }
 
     fn forward(&self, input: Tensor<B, 3>, state: &mut MimiSelfAttentionState<B>) -> Tensor<B, 3> {
-        let [batch, seq, _] = input.dims();
         let projected = apply_linear(&self.in_proj, input);
-        let qkv = projected.reshape([batch, seq, 3, self.num_heads, self.head_dim]);
-        let q = qkv
-            .clone()
-            .narrow(2, 0, 1)
-            .reshape([batch, seq, self.num_heads, self.head_dim])
-            .swap_dims(1, 2);
-        let k = qkv
-            .clone()
-            .narrow(2, 1, 1)
-            .reshape([batch, seq, self.num_heads, self.head_dim])
-            .swap_dims(1, 2);
-        let v = qkv
-            .narrow(2, 2, 1)
-            .reshape([batch, seq, self.num_heads, self.head_dim])
-            .swap_dims(1, 2);
+        let (q, k, v) = split_qkv(projected, self.num_heads, self.head_dim);
 
         let (q_rot, k_rot) = apply_rope(
             q.swap_dims(1, 2),
@@ -231,8 +219,7 @@ impl<B: Backend + 'static> MimiSelfAttention<B> {
         state.keys = Some(keys);
         state.values = Some(values);
 
-        let merged = attended.swap_dims(1, 2).reshape([batch, seq, self.num_heads * self.head_dim]);
-        apply_linear(&self.out_proj, merged)
+        apply_linear(&self.out_proj, merge_heads(attended))
     }
 }
 

@@ -1,5 +1,5 @@
 use crate::modules::layer_scale::{LayerScale, LayerScaleConfig};
-use crate::modules::linear::{apply_layer_norm_3d, apply_linear_3d};
+use crate::modules::linear::{apply_layer_norm_3d, apply_linear_3d, merge_heads, split_qkv};
 use crate::modules::streaming_mha::{StreamingMha, StreamingMhaConfig, StreamingMhaOp, StreamingMhaState};
 use crate::state::StreamingModule;
 use burn::tensor::activation::gelu;
@@ -109,7 +109,7 @@ impl<B: Backend + 'static> StreamingTransformerLayer<B> {
         let residual = input.clone();
         let normalized = apply_layer_norm_3d(&self.norm1, input);
         let qkv = self.apply_linear(&self.qkv, normalized);
-        let (queries, keys, values) = self.split_qkv(qkv);
+        let (queries, keys, values) = split_qkv(qkv, self.num_heads, self.head_dim);
 
         let start = state.mha.step.index;
         let queries = self.mha.apply_rope(queries, start);
@@ -117,7 +117,7 @@ impl<B: Backend + 'static> StreamingTransformerLayer<B> {
 
         self.mha.append_kv(&mut state.mha, keys, values);
         let attn = self.mha.attention(&state.mha, queries);
-        let attn = self.merge_heads(attn);
+        let attn = merge_heads(attn);
         let attn = self.apply_linear(&self.out_proj, attn);
         let attn = match &self.layer_scale_1 {
             Some(scale) => scale.apply(attn),
@@ -141,31 +141,6 @@ impl<B: Backend + 'static> StreamingTransformerLayer<B> {
         apply_linear_3d(linear, input)
     }
 
-    fn split_qkv(&self, qkv: Tensor<B, 3>) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {
-        let [batch, seq, _] = qkv.dims();
-        let qkv = qkv.reshape([batch, seq, 3, self.num_heads, self.head_dim]);
-        let q = qkv
-            .clone()
-            .narrow(2, 0, 1)
-            .reshape([batch, seq, self.num_heads, self.head_dim]);
-        let k = qkv
-            .clone()
-            .narrow(2, 1, 1)
-            .reshape([batch, seq, self.num_heads, self.head_dim]);
-        let v = qkv
-            .narrow(2, 2, 1)
-            .reshape([batch, seq, self.num_heads, self.head_dim]);
-        let q = q.swap_dims(1, 2);
-        let k = k.swap_dims(1, 2);
-        let v = v.swap_dims(1, 2);
-        (q, k, v)
-    }
-
-    fn merge_heads(&self, input: Tensor<B, 4>) -> Tensor<B, 3> {
-        let [batch, heads, seq, dim] = input.dims();
-        let merged = input.swap_dims(1, 2).reshape([batch, seq, heads * dim]);
-        merged
-    }
 }
 
 impl<B: Backend + 'static> StreamingModule<B> for StreamingTransformerLayer<B> {
