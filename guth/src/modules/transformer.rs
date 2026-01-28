@@ -138,6 +138,11 @@ impl<B: Backend> StreamingTransformerLayer<B> {
 
     fn apply_linear(&self, linear: &Linear<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
         let [batch, seq, dim] = input.dims();
+        if seq == 0 {
+            let out_dim = linear.weight.dims()[1];
+            let device = input.device();
+            return Tensor::zeros([batch, 0, out_dim], &device);
+        }
         let flat = input.reshape([batch * seq, dim]);
         let output = linear.forward(flat);
         let out_dim = output.dims()[1];
@@ -146,6 +151,9 @@ impl<B: Backend> StreamingTransformerLayer<B> {
 
     fn apply_layer_norm(&self, norm: &LayerNorm<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
         let [batch, seq, dim] = input.dims();
+        if seq == 0 {
+            return input;
+        }
         let flat = input.reshape([batch * seq, dim]);
         let output = norm.forward(flat);
         output.reshape([batch, seq, dim])
@@ -472,6 +480,38 @@ mod tests {
 
         let diff = max_abs_diff(batch_output, stream_output);
         assert!(diff < 1e-4, "max diff {diff}");
+    }
+
+    #[test]
+    fn apply_linear_empty_sequence_returns_empty() {
+        let device = NdArrayDevice::default();
+        let config = StreamingTransformerLayerConfig {
+            d_model: 4,
+            num_heads: 2,
+            ffn_dim: 8,
+            causal: true,
+            ..Default::default()
+        };
+        let layer = StreamingTransformerLayer::<TestBackend>::new(config, &device);
+        let input = Tensor::<TestBackend, 3>::zeros([1, 0, 4], &device);
+        let output = layer.apply_linear(&layer.ffn_in, input);
+        assert_eq!(output.dims(), [1, 0, 8]);
+    }
+
+    #[test]
+    fn apply_layer_norm_empty_sequence_returns_empty() {
+        let device = NdArrayDevice::default();
+        let config = StreamingTransformerLayerConfig {
+            d_model: 4,
+            num_heads: 2,
+            ffn_dim: 8,
+            causal: true,
+            ..Default::default()
+        };
+        let layer = StreamingTransformerLayer::<TestBackend>::new(config, &device);
+        let input = Tensor::<TestBackend, 3>::zeros([2, 0, 4], &device);
+        let output = layer.apply_layer_norm(&layer.norm1, input);
+        assert_eq!(output.dims(), [2, 0, 4]);
     }
 
     #[test]
