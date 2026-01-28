@@ -214,6 +214,31 @@ mod tests {
     }
 
     #[test]
+    fn prepare_text_prompt_rejects_empty() {
+        let err = TextTokenizer::prepare_text_prompt("   \n").unwrap_err();
+        assert!(err.to_string().contains("Text prompt cannot be empty"));
+    }
+
+    #[test]
+    fn split_long_text_respects_max_tokens() {
+        let fixture = load_fixture();
+        let model_path = fixture_path(&fixture.model_file);
+        let tokenizer = TextTokenizer::open(model_path).expect("open tokenizer");
+
+        let long_text = "This is a sentence.".repeat(40);
+        let max_tokens = 24;
+        let chunks = tokenizer
+            .split_into_best_sentences(&long_text, max_tokens)
+            .expect("split");
+
+        assert!(chunks.len() > 1);
+        for chunk in chunks {
+            let tokens = tokenizer.encode(&chunk).expect("encode chunk");
+            assert!(tokens.len() <= max_tokens);
+        }
+    }
+
+    #[test]
     fn tokenizer_matches_fixture() {
         let fixture = load_fixture();
         let model_path = fixture_path(&fixture.model_file);

@@ -158,4 +158,21 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].len(), 3);
     }
+
+    #[test]
+    fn read_audio_rejects_unsupported_extension() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("audio.flac");
+        std::fs::write(&path, b"not-audio").expect("write file");
+        let err = WavIo::read_audio(&path).unwrap_err();
+        assert!(err.to_string().contains("Unsupported audio extension"));
+    }
+
+    #[test]
+    fn read_ogg_rejects_invalid_file() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("audio.ogg");
+        std::fs::write(&path, b"not-ogg").expect("write file");
+        assert!(WavIo::read_ogg(&path).is_err());
+    }
 }

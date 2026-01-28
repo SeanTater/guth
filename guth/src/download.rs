@@ -34,7 +34,6 @@ fn parse_hf_path(path: &str) -> Result<(String, String, Option<String>)> {
     if parts.len() < 3 {
         anyhow::bail!("Invalid hf:// path: {path}");
     }
-
     let repo_id = format!("{}/{}", parts.remove(0), parts.remove(0));
     let filename = parts.join("/");
 
@@ -43,4 +42,15 @@ fn parse_hf_path(path: &str) -> Result<(String, String, Option<String>)> {
     }
 
     Ok((repo_id, filename, None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::download_if_necessary;
+
+    #[test]
+    fn download_rejects_invalid_hf_path() {
+        let err = download_if_necessary("hf://too-short").unwrap_err();
+        assert!(err.to_string().contains("Invalid hf:// path"));
+    }
 }
