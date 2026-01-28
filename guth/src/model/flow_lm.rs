@@ -285,7 +285,9 @@ impl<B: Backend> FlowLmModel<B> {
 fn apply_linear_3d<B: Backend>(linear: &Linear<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
     let [batch, seq, dim] = input.dims();
     if seq == 0 {
-        return input;
+        let out_dim = linear.weight.dims()[1];
+        let device = input.device();
+        return Tensor::<B, 3>::zeros([batch, 0, out_dim], &device);
     }
     let flat = input.reshape([batch * seq, dim]);
     let output = linear.forward(flat);
@@ -304,14 +306,24 @@ fn apply_layer_norm_3d<B: Backend>(norm: &LayerNorm<B>, input: Tensor<B, 3>) -> 
 }
 
 fn tensor_f32(tensor: &crate::weights::TensorData) -> anyhow::Result<Vec<f32>> {
-    if tensor.dtype != Dtype::F32 {
-        anyhow::bail!("Unsupported dtype {:?}", tensor.dtype);
+    match tensor.dtype {
+        Dtype::F32 => {
+            let mut values = Vec::with_capacity(tensor.data.len() / 4);
+            for chunk in tensor.data.chunks_exact(4) {
+                values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+            Ok(values)
+        }
+        Dtype::BF16 => {
+            let mut values = Vec::with_capacity(tensor.data.len() / 2);
+            for chunk in tensor.data.chunks_exact(2) {
+                let bits = u16::from_le_bytes(chunk.try_into().unwrap()) as u32;
+                values.push(f32::from_bits(bits << 16));
+            }
+            Ok(values)
+        }
+        _ => anyhow::bail!("Unsupported dtype {:?}", tensor.dtype),
     }
-    let mut values = Vec::with_capacity(tensor.data.len() / 4);
-    for chunk in tensor.data.chunks_exact(4) {
-        values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
-    }
-    Ok(values)
 }
 
 fn tensor1_from_data<B: Backend>(

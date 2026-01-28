@@ -82,7 +82,10 @@ impl<B: Backend> TtsModel<B> {
             }
             if let Some(weight) = tts_state.speaker_proj_weight {
                 speaker_proj_weight = tensor2_from_data(&weight, device)?;
+            } else if let Some(weight) = tts_state.flow_lm.get("speaker_proj_weight") {
+                speaker_proj_weight = tensor2_from_data(weight, device)?;
             }
+            let speaker_proj_weight = speaker_proj_weight.transpose();
             return Ok(Self::new(
                 flow_lm,
                 mimi,
@@ -115,6 +118,7 @@ impl<B: Backend> TtsModel<B> {
             mimi.load_state_dict(&mimi_state, device)?;
         }
 
+        let speaker_proj_weight = speaker_proj_weight.transpose();
         Ok(Self::new(
             flow_lm,
             mimi,
@@ -287,19 +291,37 @@ impl<B: Backend> TtsModel<B> {
         let backbone_input_latents = backbone_input_latents.unwrap_or_else(|| {
             Tensor::<B, 3>::zeros([1, 0, self.flow_lm.ldim], &device)
         });
-        let audio_conditioning = audio_conditioning.unwrap_or_else(|| {
-            Tensor::<B, 3>::zeros([1, 0, self.flow_lm.dim], &device)
-        });
-
         let text_len = text_tokens.dims()[1];
         let backbone_len = backbone_input_latents.dims()[1];
-        let audio_len = audio_conditioning.dims()[1];
 
         let text_embeddings = if text_len == 0 {
             Tensor::<B, 3>::zeros([1, 0, self.flow_lm.dim], &device)
         } else {
             self.flow_lm.conditioner.forward_tokens(text_tokens.clone())
         };
+        let mut audio_conditioning = audio_conditioning.unwrap_or_else(|| {
+            let dim = if text_len == 0 {
+                self.flow_lm.dim
+            } else {
+                text_embeddings.dims()[2]
+            };
+            Tensor::<B, 3>::zeros([1, 0, dim], &device)
+        });
+        let audio_len = audio_conditioning.dims()[1];
+        if text_embeddings.dims()[2] != audio_conditioning.dims()[2] {
+            if audio_len == 0 {
+                audio_conditioning = Tensor::<B, 3>::zeros(
+                    [1, 0, text_embeddings.dims()[2]],
+                    &device,
+                );
+            } else {
+                panic!(
+                    "Audio conditioning dim {} does not match text embedding dim {}",
+                    audio_conditioning.dims()[2],
+                    text_embeddings.dims()[2]
+                );
+            }
+        }
         let text_embeddings = Tensor::cat(vec![text_embeddings, audio_conditioning.clone()], 1);
 
         let (latent, is_eos) = self.flow_lm.sample_next_latent(
@@ -350,12 +372,22 @@ fn tensor2_from_data<B: Backend>(
     let shape: [usize; 2] = tensor.shape.clone().try_into().map_err(|_| {
         anyhow::anyhow!("Expected 2D tensor, got shape {:?}", tensor.shape)
     })?;
-    if tensor.dtype != safetensors::Dtype::F32 {
-        anyhow::bail!("Unsupported dtype {:?}", tensor.dtype);
-    }
-    let mut values = Vec::with_capacity(tensor.data.len() / 4);
-    for chunk in tensor.data.chunks_exact(4) {
-        values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    let mut values = Vec::new();
+    match tensor.dtype {
+        safetensors::Dtype::F32 => {
+            values.reserve(tensor.data.len() / 4);
+            for chunk in tensor.data.chunks_exact(4) {
+                values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+        }
+        safetensors::Dtype::BF16 => {
+            values.reserve(tensor.data.len() / 2);
+            for chunk in tensor.data.chunks_exact(2) {
+                let bits = u16::from_le_bytes(chunk.try_into().unwrap()) as u32;
+                values.push(f32::from_bits(bits << 16));
+            }
+        }
+        _ => anyhow::bail!("Unsupported dtype {:?}", tensor.dtype),
     }
     Ok(Tensor::from_data(burn::tensor::TensorData::new(values, shape), device))
 }

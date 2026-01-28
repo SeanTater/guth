@@ -112,7 +112,7 @@ fn main() -> Result<()> {
             if voice.is_some() {
                 anyhow::bail!("Predefined voices are not wired yet; use --voice-file for now.");
             }
-            let config_path = config;
+            let config_path = resolve_config_path(config);
             let cfg = load_config(&config_path)?;
             let device = NdArrayDevice::default();
             let tts = TtsModel::<NdArray<f32>>::from_config(
@@ -191,7 +191,7 @@ fn main() -> Result<()> {
         }
         Commands::Voice { command } => match command {
             VoiceCommands::Encode { input, output, config } => {
-                let cfg = load_config(&config)?;
+                let cfg = load_config(resolve_config_path(config))?;
                 let device = NdArrayDevice::default();
                 let tts = TtsModel::<NdArray<f32>>::from_config(
                     &cfg,
@@ -319,7 +319,7 @@ fn download_model(model: &str) -> Result<()> {
         "b6369a24" => PathBuf::from("pocket_tts/config/b6369a24.yaml"),
         _ => anyhow::bail!("Unknown model {model}"),
     };
-    let cfg = load_config(&config_path)?;
+    let cfg = load_config(resolve_config_path(config_path))?;
 
     if let Some(path) = cfg.weights_path.as_ref() {
         let _ = guth::download::download_if_necessary(path)?;
@@ -336,4 +336,15 @@ fn download_model(model: &str) -> Result<()> {
     let _ = guth::download::download_if_necessary(&cfg.flow_lm.lookup_table.tokenizer_path)?;
     println!("Downloaded model artifacts for {model}");
     Ok(())
+}
+
+fn resolve_config_path(path: PathBuf) -> PathBuf {
+    if path.exists() {
+        return path;
+    }
+    let candidate = PathBuf::from("..").join(&path);
+    if candidate.exists() {
+        return candidate;
+    }
+    path
 }

@@ -498,14 +498,24 @@ fn build_seanet_decoder<B: Backend>(config: &SeanetConfig, device: &B::Device) -
 }
 
 fn tensor_f32(tensor: &crate::weights::TensorData) -> anyhow::Result<Vec<f32>> {
-    if tensor.dtype != Dtype::F32 {
-        anyhow::bail!("Unsupported dtype {:?}", tensor.dtype);
+    match tensor.dtype {
+        Dtype::F32 => {
+            let mut values = Vec::with_capacity(tensor.data.len() / 4);
+            for chunk in tensor.data.chunks_exact(4) {
+                values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+            Ok(values)
+        }
+        Dtype::BF16 => {
+            let mut values = Vec::with_capacity(tensor.data.len() / 2);
+            for chunk in tensor.data.chunks_exact(2) {
+                let bits = u16::from_le_bytes(chunk.try_into().unwrap()) as u32;
+                values.push(f32::from_bits(bits << 16));
+            }
+            Ok(values)
+        }
+        _ => anyhow::bail!("Unsupported dtype {:?}", tensor.dtype),
     }
-    let mut values = Vec::with_capacity(tensor.data.len() / 4);
-    for chunk in tensor.data.chunks_exact(4) {
-        values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
-    }
-    Ok(values)
 }
 
 fn tensor1_from_data<B: Backend>(

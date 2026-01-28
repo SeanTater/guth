@@ -119,6 +119,13 @@ pub fn load_tts_state_dict(path: impl AsRef<Path>) -> Result<TtsStateDict> {
                 new_name = "speaker_proj_weight".to_string();
             }
             let tensor = tensors.tensor(name)?;
+            if rest == "speaker_proj_weight" || new_name == "speaker_proj_weight" {
+                speaker_proj_weight = Some(TensorData {
+                    dtype: tensor.dtype(),
+                    shape: tensor.shape().iter().map(|v| *v as usize).collect(),
+                    data: tensor.data().to_vec(),
+                });
+            }
             flow_lm.insert(
                 new_name,
                 TensorData {
