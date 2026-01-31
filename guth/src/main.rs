@@ -124,7 +124,7 @@ fn main() -> Result<()> {
                 temp.unwrap_or(0.0),
                 lsd_decode_steps.unwrap_or(2),
                 noise_clamp,
-                eos_threshold.unwrap_or(0.0),
+                eos_threshold.unwrap_or(-4.0),
                 &device,
             )?;
 
@@ -332,7 +332,7 @@ fn load_conditioning_tensor(
     let data = std::fs::read(path)?;
     let safetensors = safetensors::SafeTensors::deserialize(&data)?;
     let tensor_view = safetensors
-        .tensor("conditioning")
+        .tensor("audio_prompt")
         .map_err(|e| anyhow::anyhow!("Failed to load conditioning tensor: {e}"))?;
     let shape = tensor_view.shape();
     if shape.len() != 3 {

@@ -1,10 +1,8 @@
 use crate::state::{StreamStep, StreamingModule};
-use burn::tensor::backend::Backend;
 use burn::tensor::activation::softmax;
+use burn::tensor::backend::Backend;
 use burn::tensor::{Bool, Int, Tensor};
 use std::marker::PhantomData;
-#[cfg(feature = "backend-cpu")]
-use std::any::TypeId;
 
 #[derive(Debug, Default)]
 pub struct StreamingMha;
@@ -59,7 +57,7 @@ pub struct StreamingMhaOp<B: Backend> {
     _backend: PhantomData<B>,
 }
 
-impl<B: Backend + 'static> StreamingMhaOp<B> {
+impl<B: Backend> StreamingMhaOp<B> {
     pub fn new(config: StreamingMhaConfig, device: &B::Device) -> Self {
         let _ = device;
         Self {
@@ -68,7 +66,12 @@ impl<B: Backend + 'static> StreamingMhaOp<B> {
         }
     }
 
-    pub fn append_kv(&self, state: &mut StreamingMhaState<B>, keys: Tensor<B, 4>, values: Tensor<B, 4>) {
+    pub fn append_kv(
+        &self,
+        state: &mut StreamingMhaState<B>,
+        keys: Tensor<B, 4>,
+        values: Tensor<B, 4>,
+    ) {
         let added = keys.dims()[2];
         let combined_keys = match state.keys.take() {
             Some(existing) => Tensor::cat(vec![existing, keys], 2),
@@ -95,9 +98,6 @@ impl<B: Backend + 'static> StreamingMhaOp<B> {
     }
 
     pub fn apply_rope(&self, tensor: Tensor<B, 4>, start: usize) -> Tensor<B, 4> {
-        if self.config.rope_max_seq.is_none() {
-            return tensor;
-        }
         let [batch, heads, seq, dim] = tensor.dims();
         let half = dim / 2;
         let device = tensor.device();
@@ -117,20 +117,37 @@ impl<B: Backend + 'static> StreamingMhaOp<B> {
         let rotr = angles.clone().cos();
         let roti = angles.sin();
 
-        let rotr = rotr.unsqueeze_dim::<3>(0).unsqueeze_dim::<4>(2).repeat_dim(0, batch).repeat_dim(2, heads);
-        let roti = roti.unsqueeze_dim::<3>(0).unsqueeze_dim::<4>(2).repeat_dim(0, batch).repeat_dim(2, heads);
+        let rotr = rotr
+            .unsqueeze_dim::<3>(0)
+            .unsqueeze_dim::<4>(2)
+            .repeat_dim(0, batch)
+            .repeat_dim(2, heads);
+        let roti = roti
+            .unsqueeze_dim::<3>(0)
+            .unsqueeze_dim::<4>(2)
+            .repeat_dim(0, batch)
+            .repeat_dim(2, heads);
 
         let reshaped = tensor
             .swap_dims(1, 2)
             .reshape([batch, seq, heads, half, 2]);
-        let real = reshaped.clone().narrow(4, 0, 1).reshape([batch, seq, heads, half]);
-        let imag = reshaped.clone().narrow(4, 1, 1).reshape([batch, seq, heads, half]);
+        let real = reshaped
+            .clone()
+            .narrow(4, 0, 1)
+            .reshape([batch, seq, heads, half]);
+        let imag = reshaped
+            .clone()
+            .narrow(4, 1, 1)
+            .reshape([batch, seq, heads, half]);
 
         let rot_real = real.clone().mul(rotr.clone()).sub(imag.clone().mul(roti.clone()));
         let rot_imag = real.mul(roti).add(imag.mul(rotr));
 
         let rotated = Tensor::cat(
-            vec![rot_real.unsqueeze_dim::<5>(4), rot_imag.unsqueeze_dim::<5>(4)],
+            vec![
+                rot_real.unsqueeze_dim::<5>(4),
+                rot_imag.unsqueeze_dim::<5>(4),
+            ],
             4,
         )
         .reshape([batch, seq, heads, dim])
@@ -140,27 +157,17 @@ impl<B: Backend + 'static> StreamingMhaOp<B> {
     }
 
     pub fn attention(&self, state: &StreamingMhaState<B>, queries: Tensor<B, 4>) -> Tensor<B, 4> {
-        #[cfg(feature = "backend-cpu")]
-        if TypeId::of::<B>() == TypeId::of::<burn_cpu::Cpu>() {
-            return self.attention_cpu(state, queries);
-        }
         let keys = state.keys.clone().expect("keys must be set");
         let values = state.values.clone().expect("values must be set");
         let batch = queries.dims()[0];
         let heads = queries.dims()[1];
         let q_len = queries.dims()[2];
         let k_len = keys.dims()[2];
+
         let q_start = state.step.index.saturating_sub(q_len);
         let k_start = state.step.index.saturating_sub(state.cached_tokens);
-        let mask = self.build_mask(
-            batch,
-            heads,
-            q_len,
-            q_start,
-            k_len,
-            k_start,
-            &queries.device(),
-        );
+        let mask = self.build_mask(batch, heads, q_len, q_start, k_len, k_start, &queries.device());
+
         let scale = (self.config.head_dim as f32).sqrt();
         let scores = queries
             .matmul(keys.clone().swap_dims(2, 3))
@@ -175,93 +182,6 @@ impl<B: Backend + 'static> StreamingMhaOp<B> {
         weights.matmul(values)
     }
 
-    #[cfg(feature = "backend-cpu")]
-    fn attention_cpu(&self, state: &StreamingMhaState<B>, queries: Tensor<B, 4>) -> Tensor<B, 4> {
-        let keys = state.keys.clone().expect("keys must be set");
-        let values = state.values.clone().expect("values must be set");
-        let [batch, heads, q_len, head_dim] = queries.dims();
-        let k_len = keys.dims()[2];
-        let device = queries.device();
-
-        if batch == 0 || heads == 0 || q_len == 0 || k_len == 0 || head_dim == 0 {
-            return Tensor::from_data(
-                burn::tensor::TensorData::new(Vec::<f32>::new(), [batch, heads, 0, head_dim]),
-                &device,
-            );
-        }
-
-        let q_data = queries.to_data();
-        let k_data = keys.to_data();
-        let v_data = values.to_data();
-        let q_vals = q_data.as_slice::<f32>().expect("cpu attention expects f32 queries");
-        let k_vals = k_data.as_slice::<f32>().expect("cpu attention expects f32 keys");
-        let v_vals = v_data.as_slice::<f32>().expect("cpu attention expects f32 values");
-
-        let q_start = state.step.index.saturating_sub(q_len);
-        let k_start = state.step.index.saturating_sub(state.cached_tokens);
-        let mask = self.build_mask(batch, heads, q_len, q_start, k_len, k_start, &device);
-        let mask_data = mask.as_ref().map(|mask| mask.to_data());
-        let mask_vals = mask_data
-            .as_ref()
-            .map(|data| data.as_slice::<u8>().expect("cpu attention expects bool mask"));
-
-        let scale = (self.config.head_dim as f32).sqrt();
-        let mut output = vec![0.0f32; batch * heads * q_len * head_dim];
-
-        for b in 0..batch {
-            for h in 0..heads {
-                for q in 0..q_len {
-                    let mut scores = vec![0.0f32; k_len];
-                    for k in 0..k_len {
-                        let mut acc = 0.0f32;
-                        for d in 0..head_dim {
-                            let q_idx = (((b * heads + h) * q_len + q) * head_dim) + d;
-                            let k_idx = (((b * heads + h) * k_len + k) * head_dim) + d;
-                            acc += q_vals[q_idx] * k_vals[k_idx];
-                        }
-                        let mut score = acc / scale;
-                        if let Some(mask_vals) = mask_vals {
-                            let m_idx = (((b * heads + h) * q_len + q) * k_len) + k;
-                            if mask_vals[m_idx] != 0 {
-                                score = -1.0e9;
-                            }
-                        }
-                        scores[k] = score;
-                    }
-
-                    let mut max = f32::NEG_INFINITY;
-                    for score in &scores {
-                        if *score > max {
-                            max = *score;
-                        }
-                    }
-
-                    let mut denom = 0.0f32;
-                    for score in &mut scores {
-                        *score = (*score - max).exp();
-                        denom += *score;
-                    }
-                    if denom == 0.0 {
-                        continue;
-                    }
-
-                    for k in 0..k_len {
-                        let weight = scores[k] / denom;
-                        for d in 0..head_dim {
-                            let out_idx = (((b * heads + h) * q_len + q) * head_dim) + d;
-                            let v_idx = (((b * heads + h) * k_len + k) * head_dim) + d;
-                            output[out_idx] += weight * v_vals[v_idx];
-                        }
-                    }
-                }
-            }
-        }
-
-        Tensor::from_data(
-            burn::tensor::TensorData::new(output, [batch, heads, q_len, head_dim]),
-            &device,
-        )
-    }
     fn build_mask(
         &self,
         batch: usize,
@@ -292,7 +212,7 @@ impl<B: Backend + 'static> StreamingMhaOp<B> {
             mask = mask.bool_or(lower_mask);
         }
 
-        let mask = mask.reshape([1, 1, q_len, k_len]); 
+        let mask = mask.reshape([1, 1, q_len, k_len]);
         let mask = mask.repeat_dim(0, batch).repeat_dim(1, heads);
         Some(mask)
     }

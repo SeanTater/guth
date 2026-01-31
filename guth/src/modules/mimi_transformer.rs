@@ -162,6 +162,7 @@ impl<B: Backend + 'static> MimiSelfAttention<B> {
 
     fn forward(&self, input: Tensor<B, 3>, state: &mut MimiSelfAttentionState<B>) -> Tensor<B, 3> {
         let projected = apply_linear(&self.in_proj, input);
+
         let (q, k, v) = split_qkv(projected, self.num_heads, self.head_dim);
 
         let (q_rot, k_rot) = apply_rope(
@@ -170,8 +171,12 @@ impl<B: Backend + 'static> MimiSelfAttention<B> {
             state.offset.clone(),
             self.max_period,
         );
+
         let q = q_rot.swap_dims(1, 2);
         let k = k_rot.swap_dims(1, 2);
+
+        // Track whether we had cached keys (for context trimming decision)
+        let had_cached_keys = state.keys.is_some();
 
         let mut keys = match state.keys.take() {
             Some(existing) => Tensor::cat(vec![existing, k], 2),
@@ -182,8 +187,11 @@ impl<B: Backend + 'static> MimiSelfAttention<B> {
             None => v,
         };
 
+        // Only trim to context window when we have accumulated cached keys.
+        // On the first forward (batch processing), we need all keys for proper
+        // causal attention within the sequence.
         let total_k = keys.dims()[2];
-        if self.context > 0 && total_k > self.context {
+        if had_cached_keys && self.context > 0 && total_k > self.context {
             let start = total_k - self.context;
             keys = keys.narrow(2, start, self.context);
             values = values.narrow(2, start, self.context);

@@ -98,7 +98,7 @@ impl<B: Backend> ConvTrUpsample1d<B> {
     }
 
     pub fn init_state(&self, batch_size: usize, device: &B::Device) -> ConvTrUpsample1dState<B> {
-        let out_channels = self.conv.weight.dims()[1];
+        let out_channels = self.conv.weight.dims()[1] * self.conv.config.groups;
         let state = init_conv_transpose_state(&self.conv.config, batch_size, out_channels, device);
         ConvTrUpsample1dState { conv: state }
     }

@@ -149,6 +149,7 @@ impl<B: Backend + 'static> FlowLmModel<B> {
     ) -> (Tensor<B, 2>, Tensor<B, 2, Bool>) {
         let [batch, seq_len, _] = sequence.dims();
         let device = sequence.device();
+
         let sequence = if seq_len == 0 {
             sequence
         } else {
@@ -158,7 +159,17 @@ impl<B: Backend + 'static> FlowLmModel<B> {
                 .reshape([1, 1, self.ldim])
                 .repeat_dim(0, batch)
                 .repeat_dim(1, seq_len);
-            let nan_mask = sequence.clone().is_nan();
+
+            // Workaround for burn-ndarray issue: is_nan() doesn't detect NaN values correctly.
+            // Pull data to host, check for NaN manually, and create a mask tensor.
+            let seq_data = sequence.clone().to_data();
+            let seq_vals = seq_data.as_slice::<f32>().expect("sequence must be f32");
+            let mask_vals: Vec<bool> = seq_vals.iter().map(|v| v.is_nan()).collect();
+            let nan_mask = Tensor::<B, 3, Bool>::from_data(
+                burn::tensor::TensorData::new(mask_vals, sequence.dims()),
+                &device,
+            );
+
             sequence.mask_where(nan_mask, bos)
         };
 

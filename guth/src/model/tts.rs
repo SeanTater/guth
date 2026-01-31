@@ -73,7 +73,7 @@ impl<B: Backend + 'static> TtsModel<B> {
                     }
                 }
             };
-            let tts_state = load_tts_state_dict(weights_path)?;
+            let tts_state = load_tts_state_dict(&weights_path)?;
             if !tts_state.flow_lm.is_empty() {
                 flow_lm.load_state_dict(&tts_state.flow_lm, device)?;
             }
@@ -395,7 +395,9 @@ impl<B: Backend + 'static> TtsModel<B> {
         let transposed = decoded.swap_dims(1, 2);
         let quantized = self.mimi.quantizer.forward(transposed);
         let audio = self.mimi.decode_from_latent(quantized, state);
-        self.mimi.increment_step(state, 1);
+        // Increment by upsample stride, not 1, to match Python's behavior
+        // The decoder transformer processes `upsample_stride` upsampled time steps per input frame
+        self.mimi.increment_step(state, self.mimi.upsample_stride());
         audio
     }
 }

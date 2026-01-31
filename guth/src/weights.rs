@@ -185,9 +185,19 @@ fn map_mimi_name(name: &str) -> Option<String> {
     if let Some(rest) = name.strip_prefix("decoder_transformer.") {
         return Some(format!("decoder_transformer.{rest}"));
     }
+    // Original: downsample.conv.conv.weight -> Target: downsample.conv.weight
+    if let Some(rest) = name.strip_prefix("downsample.conv.conv.") {
+        return Some(format!("downsample.conv.{rest}"));
+    }
+    // Original: upsample.convtr.convtr.weight -> Target: upsample.conv.weight
+    if let Some(rest) = name.strip_prefix("upsample.convtr.convtr.") {
+        return Some(format!("upsample.conv.{rest}"));
+    }
+    // Fallback: downsample.conv.weight -> downsample.conv.weight (if no double prefix)
     if let Some(rest) = name.strip_prefix("downsample.conv.") {
         return Some(format!("downsample.conv.{rest}"));
     }
+    // Fallback: upsample.convtr.weight -> upsample.conv.weight (if no double prefix)
     if let Some(rest) = name.strip_prefix("upsample.convtr.") {
         return Some(format!("upsample.conv.{rest}"));
     }

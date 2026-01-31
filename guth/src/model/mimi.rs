@@ -84,6 +84,15 @@ impl<B: Backend> MimiModel<B> {
         (self.sample_rate as f32 / self.frame_rate) as usize
     }
 
+    /// Returns the upsample stride (temporal expansion factor from frame_rate to encoder_frame_rate).
+    /// This is the number of time steps the decoder_transformer processes per input latent frame.
+    pub fn upsample_stride(&self) -> usize {
+        self.upsample
+            .as_ref()
+            .map(|up| up.conv.config.stride)
+            .unwrap_or(1)
+    }
+
     pub fn from_config(config: &MimiConfig, device: &B::Device) -> Self {
         let encoder = build_seanet_encoder(&config.seanet, device);
         let decoder = build_seanet_decoder(&config.seanet, device);
