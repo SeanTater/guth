@@ -31,12 +31,9 @@ fn run_single_step<B: Backend>(device: &B::Device) {
     let max_gen_len = 1;
     let frames_after_eos = 0;
     let mut state = tts.init_state(1, tokens.dims()[1] + max_gen_len + 1, max_gen_len, device);
-    let (_latents, _eos) = tts.generate_latents_from_tokens(
-        tokens,
-        &mut state,
-        max_gen_len,
-        frames_after_eos,
-    );
+    let _ = tts
+        .generate_latents_from_tokens(tokens, &mut state, max_gen_len, frames_after_eos)
+        .expect("generate latents");
 }
 
 #[cfg(feature = "backend-cpu")]

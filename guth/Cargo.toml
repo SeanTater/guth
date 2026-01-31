@@ -39,3 +39,6 @@ nix = { version = "0.28", default-features = false, features = ["signal"] }
 
 [features]
 default = []
+backend-cpu = []
+backend-ndarray = []
+backend-wgpu = []
