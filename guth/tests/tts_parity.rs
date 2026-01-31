@@ -429,12 +429,14 @@ fn tts_model_matches_fixture() {
     let flow_len = tokens.dims()[1] + fixture.generation.max_gen_len + 1;
     let mut state = tts.init_state(1, flow_len, fixture.generation.max_gen_len, &device);
 
-    let (latents, eos, audio) = tts.generate_audio_from_tokens(
-        tokens,
-        &mut state,
-        fixture.generation.max_gen_len,
-        fixture.generation.frames_after_eos,
-    );
+    let (latents, eos, audio) = tts
+        .generate_audio_from_tokens(
+            tokens,
+            &mut state,
+            fixture.generation.max_gen_len,
+            fixture.generation.frames_after_eos,
+        )
+        .expect("generate audio");
 
     latents.to_data().assert_approx_eq(
         &tensor3(&device, fixture.latents).to_data(),
@@ -460,12 +462,14 @@ fn tts_streaming_matches_batch() {
     let tokens = tensor2_int(&device, fixture.conditioner.tokens.clone());
     let flow_len = tokens.dims()[1] + fixture.generation.max_gen_len + 1;
     let mut batch_state = batch_tts.init_state(1, flow_len, fixture.generation.max_gen_len, &device);
-    let (_latents, _eos, batch_audio) = batch_tts.generate_audio_from_tokens(
-        tokens,
-        &mut batch_state,
-        fixture.generation.max_gen_len,
-        fixture.generation.frames_after_eos,
-    );
+    let (_latents, _eos, batch_audio) = batch_tts
+        .generate_audio_from_tokens(
+            tokens,
+            &mut batch_state,
+            fixture.generation.max_gen_len,
+            fixture.generation.frames_after_eos,
+        )
+        .expect("generate audio");
 
     let stream_tts = build_tts_model(&fixture, &device);
     let tokens = tensor2_int(&device, fixture.conditioner.tokens);

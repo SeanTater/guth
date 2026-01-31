@@ -98,7 +98,7 @@ fn run_bench<B: Backend>(
                 &mut state,
                 args.max_gen_len,
                 frames_after_eos,
-            );
+            )?;
             durations.push(start.elapsed());
         }
     }

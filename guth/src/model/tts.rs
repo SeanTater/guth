@@ -148,13 +148,13 @@ impl<B: Backend + 'static> TtsModel<B> {
         state: &mut TtsState<B>,
         max_gen_len: usize,
         frames_after_eos: usize,
-    ) -> (Tensor<B, 3>, Tensor<B, 2, Bool>) {
+    ) -> anyhow::Result<(Tensor<B, 3>, Tensor<B, 2, Bool>)> {
         self.run_flow_lm_and_increment(
             state,
             Some(tokens.clone()),
             None,
             None,
-        );
+        )?;
 
         let [batch, _] = tokens.dims();
         let device = tokens.device();
@@ -170,7 +170,7 @@ impl<B: Backend + 'static> TtsModel<B> {
 
         for step in 0..max_gen_len {
             let (latent, is_eos) =
-                self.run_flow_lm_and_increment(state, None, Some(backbone_input.clone()), None);
+                self.run_flow_lm_and_increment(state, None, Some(backbone_input.clone()), None)?;
             if eos_step.is_none() {
                 let eos_any = is_eos.clone().any().into_scalar();
                 if eos_any.elem() {
@@ -191,7 +191,7 @@ impl<B: Backend + 'static> TtsModel<B> {
 
         let latents = Tensor::cat(latents, 1);
         let eos_flags = Tensor::cat(eos_flags, 1);
-        (latents, eos_flags)
+        Ok((latents, eos_flags))
     }
 
     pub fn decode_latents(&self, latents: Tensor<B, 3>, state: &mut TtsState<B>) -> Tensor<B, 3> {
@@ -211,14 +211,17 @@ impl<B: Backend + 'static> TtsModel<B> {
         state: &mut TtsState<B>,
         max_gen_len: usize,
         frames_after_eos: usize,
-    ) -> (Tensor<B, 3>, Tensor<B, 2, Bool>, Tensor<B, 3>) {
+    ) -> anyhow::Result<(Tensor<B, 3>, Tensor<B, 2, Bool>, Tensor<B, 3>)> {
         let (latents, eos) =
-            self.generate_latents_from_tokens(tokens, state, max_gen_len, frames_after_eos);
+            self.generate_latents_from_tokens(tokens, state, max_gen_len, frames_after_eos)?;
         let audio = self.decode_latents(latents.clone(), state);
-        (latents, eos, audio)
+        Ok((latents, eos, audio))
     }
 
     /// Spawn a background worker to generate audio chunks and stream them over a channel.
+    ///
+    /// Returns a receiver that yields audio chunks. If an internal error occurs during
+    /// generation, the channel will close early. Errors are logged to stderr.
     pub fn generate_audio_stream(
         self,
         tokens: Tensor<B, 2, Int>,
@@ -234,7 +237,11 @@ impl<B: Backend + 'static> TtsModel<B> {
             let flow_len = tokens.dims()[1] + max_gen_len + 1;
             let mut state = self.init_state(1, flow_len, max_gen_len, &device);
 
-            self.run_flow_lm_and_increment(&mut state, Some(tokens), None, None);
+            // Initial text conditioning - no audio conditioning, so dimension mismatch cannot occur.
+            if let Err(e) = self.run_flow_lm_and_increment(&mut state, Some(tokens), None, None) {
+                eprintln!("Error in generate_audio_stream: {e}");
+                return;
+            }
 
             let mut backbone_input = Tensor::<B, 3>::full(
                 [1, 1, self.flow_lm.ldim],
@@ -243,8 +250,19 @@ impl<B: Backend + 'static> TtsModel<B> {
             );
             let mut eos_step: Option<usize> = None;
             for step in 0..max_gen_len {
-                let (latent, is_eos) =
-                    self.run_flow_lm_and_increment(&mut state, None, Some(backbone_input.clone()), None);
+                // Generation loop - no audio conditioning, so dimension mismatch cannot occur.
+                let (latent, is_eos) = match self.run_flow_lm_and_increment(
+                    &mut state,
+                    None,
+                    Some(backbone_input.clone()),
+                    None,
+                ) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        eprintln!("Error in generate_audio_stream: {e}");
+                        break;
+                    }
+                };
                 if eos_step.is_none() {
                     let eos_any = is_eos.clone().any().into_scalar();
                     if eos_any.elem() {
@@ -268,11 +286,16 @@ impl<B: Backend + 'static> TtsModel<B> {
         rx
     }
 
-    pub fn condition_on_audio(&self, audio_prompt: Tensor<B, 3>, state: &mut TtsState<B>) {
+    pub fn condition_on_audio(
+        &self,
+        audio_prompt: Tensor<B, 3>,
+        state: &mut TtsState<B>,
+    ) -> anyhow::Result<()> {
         let latents = self.mimi.encode_to_latent(audio_prompt);
         let latents = latents.swap_dims(1, 2);
         let conditioning = linear(latents, self.speaker_proj_weight.clone(), None);
-        self.run_flow_lm_and_increment(state, None, None, Some(conditioning));
+        self.run_flow_lm_and_increment(state, None, None, Some(conditioning))?;
+        Ok(())
     }
 
     fn run_flow_lm_and_increment(
@@ -281,7 +304,7 @@ impl<B: Backend + 'static> TtsModel<B> {
         text_tokens: Option<Tensor<B, 2, Int>>,
         backbone_input_latents: Option<Tensor<B, 3>>,
         audio_conditioning: Option<Tensor<B, 3>>,
-    ) -> (Tensor<B, 3>, Tensor<B, 2, Bool>) {
+    ) -> anyhow::Result<(Tensor<B, 3>, Tensor<B, 2, Bool>)> {
         // FlowLM manages its own KV cache append; no explicit increment needed here.
         let device = self.flow_lm.bos_emb.device();
 
@@ -312,7 +335,7 @@ impl<B: Backend + 'static> TtsModel<B> {
             if audio_len == 0 {
                 audio_conditioning = empty_tensor3::<B>(1, 0, text_embeddings.dims()[2], &device);
             } else {
-                panic!(
+                anyhow::bail!(
                     "Audio conditioning dim {} does not match text embedding dim {}",
                     audio_conditioning.dims()[2],
                     text_embeddings.dims()[2]
@@ -335,7 +358,7 @@ impl<B: Backend + 'static> TtsModel<B> {
 
         let latent_dims = latent.dims();
         let latent = latent.reshape([latent_dims[0], 1, latent_dims[1]]);
-        (latent, is_eos)
+        Ok((latent, is_eos))
     }
 
     fn decode_latent_step(

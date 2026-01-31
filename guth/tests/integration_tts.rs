@@ -461,12 +461,14 @@ fn integration_text_lengths_match_python_fixtures() {
         let tokens = tensor2_int(&device, case.tokens.clone());
         let flow_len = tokens.dims()[1] + fixture.generation.max_gen_len + 1;
         let mut state = tts.init_state(1, flow_len, fixture.generation.max_gen_len, &device);
-        let (latents, eos, audio) = tts.generate_audio_from_tokens(
-            tokens,
-            &mut state,
-            fixture.generation.max_gen_len,
-            fixture.generation.frames_after_eos,
-        );
+        let (latents, eos, audio) = tts
+            .generate_audio_from_tokens(
+                tokens,
+                &mut state,
+                fixture.generation.max_gen_len,
+                fixture.generation.frames_after_eos,
+            )
+            .expect("generate audio");
 
         let expected_latents = tensor3(&device, case.latents.clone()).to_data();
         let expected_audio = tensor3(&device, case.audio_full.clone()).to_data();
@@ -533,14 +535,17 @@ fn integration_voice_prompt_matches_fixture() {
     let flow_len =
         tokens.dims()[1] + fixture.generation.max_gen_len + conditioning_len + 1;
     let mut state = tts.init_state(1, flow_len, fixture.generation.max_gen_len, &device);
-    tts.condition_on_audio(audio_prompt, &mut state);
+    tts.condition_on_audio(audio_prompt, &mut state)
+        .expect("condition on audio");
 
-    let (latents_out, eos, audio) = tts.generate_audio_from_tokens(
-        tokens,
-        &mut state,
-        fixture.generation.max_gen_len,
-        fixture.generation.frames_after_eos,
-    );
+    let (latents_out, eos, audio) = tts
+        .generate_audio_from_tokens(
+            tokens,
+            &mut state,
+            fixture.generation.max_gen_len,
+            fixture.generation.frames_after_eos,
+        )
+        .expect("generate audio");
 
     let expected_latents = tensor3(&device, voice_case.latents.clone()).to_data();
     let expected_audio = tensor3(&device, voice_case.audio_full.clone()).to_data();

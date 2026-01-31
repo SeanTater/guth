@@ -159,7 +159,7 @@ fn main() -> Result<()> {
                     cfg.mimi.channels as usize,
                 )?;
                 let prompt_tensor = tensor_from_audio(prompt, &device);
-                tts.condition_on_audio(prompt_tensor, &mut state);
+                tts.condition_on_audio(prompt_tensor, &mut state)?;
             }
 
             let output_path = output.ok_or_else(|| anyhow::anyhow!("--output is required"))?;
@@ -190,7 +190,7 @@ fn main() -> Result<()> {
                     &mut state,
                     max_gen_len,
                     frames_after_eos,
-                );
+                )?;
                 if interrupted.load(Ordering::SeqCst) {
                     anyhow::bail!("Interrupted");
                 }
