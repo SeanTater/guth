@@ -231,11 +231,26 @@ impl<B: Backend + 'static> TtsModel<B> {
     where
         B: Backend + Send + Sync + 'static,
     {
+        let device = tokens.device();
+        let flow_len = tokens.dims()[1] + max_gen_len + 1;
+        let state = self.init_state(1, flow_len, max_gen_len, &device);
+        self.generate_audio_stream_with_state(tokens, state, max_gen_len, frames_after_eos)
+    }
+
+    /// Stream audio using a pre-conditioned state (e.g., after voice conditioning).
+    pub fn generate_audio_stream_with_state(
+        self,
+        tokens: Tensor<B, 2, Int>,
+        mut state: TtsState<B>,
+        max_gen_len: usize,
+        frames_after_eos: usize,
+    ) -> Receiver<Tensor<B, 3>>
+    where
+        B: Backend + Send + Sync + 'static,
+    {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let device = tokens.device();
-            let flow_len = tokens.dims()[1] + max_gen_len + 1;
-            let mut state = self.init_state(1, flow_len, max_gen_len, &device);
 
             // Initial text conditioning - no audio conditioning, so dimension mismatch cannot occur.
             if let Err(e) = self.run_flow_lm_and_increment(&mut state, Some(tokens), None, None) {
@@ -269,18 +284,17 @@ impl<B: Backend + 'static> TtsModel<B> {
                         eos_step = Some(step);
                     }
                 }
-                if let Some(eos_step) = eos_step {
-                    if step >= eos_step + frames_after_eos {
-                        break;
-                    }
-                }
-
                 let latent_step = latent.clone().reshape([1, 1, self.flow_lm.ldim]);
                 let audio = self.decode_latent_step(latent_step, &mut state.mimi);
                 if tx.send(audio).is_err() {
                     break;
                 }
                 backbone_input = latent.reshape([1, 1, self.flow_lm.ldim]);
+                if let Some(eos_step) = eos_step {
+                    if step >= eos_step + frames_after_eos {
+                        break;
+                    }
+                }
             }
         });
         rx

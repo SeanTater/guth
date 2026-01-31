@@ -172,7 +172,8 @@ fn main() -> Result<()> {
 
             let output_path = output.ok_or_else(|| anyhow::anyhow!("--output is required"))?;
             if stream {
-                let receiver = tts.generate_audio_stream(tokens, max_gen_len, frames_after_eos);
+                let receiver =
+                    tts.generate_audio_stream_with_state(tokens, state, max_gen_len, frames_after_eos);
                 let mut writer = StreamingWavWriter::create(
                     output_path,
                     cfg.mimi.sample_rate as u32,
