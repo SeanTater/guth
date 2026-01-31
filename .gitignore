@@ -93,3 +93,6 @@ QWEN.md
 
 # Plans
 /.plans/
+
+# Scratch workspace for temporary files
+/scratch/

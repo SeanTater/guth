@@ -95,6 +95,7 @@ This is a pure Python package with Rust extensions in `training/rust_exts/audio_
 - **Parity fixtures**: generate one-off fixtures with Python (via `uv run --with ...`); never run Python during Rust tests.
 - **Audits**: keep plan/audit notes up to date as work proceeds.
 - **Plans not checked in**: `.plans/` is ignored; update locally but don’t commit unless explicitly asked.
+- **Scratch space**: put temporary files and cloned repos in `/scratch/` (ignored by git).
 - **Commit/push cadence**: commit and push at each meaningful step (tests first, then implementation).
 
 ### Key Patterns
