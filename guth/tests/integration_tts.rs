@@ -508,6 +508,46 @@ fn integration_streaming_matches_fixture() {
 }
 
 #[test]
+fn integration_streaming_matches_full_output() {
+    let fixture: IntegrationFixture = read_fixture("tts_integration.json");
+    let device = NdArrayDevice::default();
+
+    for case in fixture.cases.iter() {
+        let _ = &case.text;
+        let tokens = tensor2_int(&device, case.tokens.clone());
+
+        let tts_full = build_tts_model(&fixture, &device);
+        let tts_stream = build_tts_model(&fixture, &device);
+
+        let flow_len = tokens.dims()[1] + fixture.generation.max_gen_len + 1;
+        let mut state_full = tts_full.init_state(1, flow_len, fixture.generation.max_gen_len, &device);
+        let state_stream = tts_stream.init_state(1, flow_len, fixture.generation.max_gen_len, &device);
+
+        let (_latents, _eos, audio_full) = tts_full
+            .generate_audio_from_tokens(
+                tokens.clone(),
+                &mut state_full,
+                fixture.generation.max_gen_len,
+                fixture.generation.frames_after_eos,
+            )
+            .expect("generate audio");
+
+        let receiver = tts_stream.generate_audio_stream_with_state(
+            tokens,
+            state_stream,
+            fixture.generation.max_gen_len,
+            fixture.generation.frames_after_eos,
+        );
+        let mut chunks = Vec::new();
+        for chunk in receiver {
+            chunks.push(chunk);
+        }
+        let stream_audio = Tensor::cat(chunks, 2);
+        assert_close(&stream_audio.to_data(), &audio_full.to_data(), 1e-4);
+    }
+}
+
+#[test]
 fn integration_voice_prompt_matches_fixture() {
     let fixture: IntegrationFixture = read_fixture("tts_integration.json");
     let Some(ref voice_case) = fixture.voice_case else {
@@ -556,4 +596,66 @@ fn integration_voice_prompt_matches_fixture() {
     let eos_slice = eos_data.as_slice::<bool>().expect("eos");
     let expected: Vec<bool> = voice_case.eos.clone().into_iter().flatten().collect();
     assert_eq!(eos_slice, expected.as_slice());
+}
+
+#[test]
+fn integration_streaming_voice_matches_full_output() {
+    let fixture: IntegrationFixture = read_fixture("tts_integration.json");
+    let Some(ref voice_case) = fixture.voice_case else {
+        return;
+    };
+    let device = NdArrayDevice::default();
+
+    let tts_full = build_tts_model(&fixture, &device);
+    let tts_stream = build_tts_model(&fixture, &device);
+    let tokens = tensor2_int(&device, voice_case.tokens.clone());
+
+    let samples = voice_case.audio_prompt.clone();
+    let channels = samples.len();
+    let len = samples.first().map(|row| row.len()).unwrap_or(0);
+    let mut flat = Vec::with_capacity(channels * len);
+    for channel in samples {
+        flat.extend(channel);
+    }
+    let audio_prompt = Tensor::<TestBackend, 3>::from_data(
+        TensorData::new(flat, [1, channels, len]),
+        &device,
+    );
+
+    let latents = tts_full.mimi.encode_to_latent(audio_prompt.clone());
+    let conditioning_len = latents.dims()[2];
+    let flow_len =
+        tokens.dims()[1] + fixture.generation.max_gen_len + conditioning_len + 1;
+
+    let mut state_full = tts_full.init_state(1, flow_len, fixture.generation.max_gen_len, &device);
+    let mut state_stream =
+        tts_stream.init_state(1, flow_len, fixture.generation.max_gen_len, &device);
+    tts_full
+        .condition_on_audio(audio_prompt.clone(), &mut state_full)
+        .expect("condition on audio");
+    tts_stream
+        .condition_on_audio(audio_prompt, &mut state_stream)
+        .expect("condition on audio");
+
+    let (_latents, _eos, audio_full) = tts_full
+        .generate_audio_from_tokens(
+            tokens.clone(),
+            &mut state_full,
+            fixture.generation.max_gen_len,
+            fixture.generation.frames_after_eos,
+        )
+        .expect("generate audio");
+
+    let receiver = tts_stream.generate_audio_stream_with_state(
+        tokens,
+        state_stream,
+        fixture.generation.max_gen_len,
+        fixture.generation.frames_after_eos,
+    );
+    let mut chunks = Vec::new();
+    for chunk in receiver {
+        chunks.push(chunk);
+    }
+    let stream_audio = Tensor::cat(chunks, 2);
+    assert_close(&stream_audio.to_data(), &audio_full.to_data(), 1e-4);
 }
