@@ -1,6 +1,7 @@
 use anyhow::Result;
 use hf_hub::api::sync::Api;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub fn make_cache_directory() -> Result<PathBuf> {
@@ -23,10 +24,68 @@ pub fn download_if_necessary(path: &str) -> Result<PathBuf> {
     }
 
     if path.starts_with("http://") || path.starts_with("https://") {
-        anyhow::bail!("HTTP(S) download not implemented yet for {path}");
+        return download_http(path);
     }
 
     Ok(PathBuf::from(path))
+}
+
+/// Download a file from an HTTP(S) URL to the cache directory.
+fn download_http(url: &str) -> Result<PathBuf> {
+    let cache_dir = make_cache_directory()?;
+
+    // Create a deterministic filename from the URL
+    let filename = url_to_cache_filename(url);
+    let cache_path = cache_dir.join(&filename);
+
+    // If already cached, return the path
+    if cache_path.exists() {
+        return Ok(cache_path);
+    }
+
+    eprintln!("Downloading {url}...");
+
+    let response = ureq::get(url)
+        .call()
+        .map_err(|e| anyhow::anyhow!("Failed to download {url}: {e}"))?;
+
+    // Read the response body into memory then write to file
+    let mut data = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut data)
+        .map_err(|e| anyhow::anyhow!("Failed to read response: {e}"))?;
+
+    // Write to a temporary file first, then rename (atomic on most filesystems)
+    let temp_path = cache_path.with_extension("tmp");
+    let mut file = fs::File::create(&temp_path)?;
+    file.write_all(&data)?;
+    file.sync_all()?;
+    drop(file);
+
+    fs::rename(&temp_path, &cache_path)?;
+
+    eprintln!("Downloaded to {}", cache_path.display());
+    Ok(cache_path)
+}
+
+/// Convert a URL to a safe cache filename.
+fn url_to_cache_filename(url: &str) -> String {
+    // Strip protocol and replace unsafe characters
+    let stripped = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+
+    // Replace path separators and other special characters
+    stripped
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '?' | '&' | '=' | '#' => '_',
+            c if c.is_ascii_alphanumeric() || c == '.' || c == '-' => c,
+            _ => '_',
+        })
+        .collect()
 }
 
 fn parse_hf_path(path: &str) -> Result<(String, String, Option<String>)> {
@@ -46,11 +105,23 @@ fn parse_hf_path(path: &str) -> Result<(String, String, Option<String>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::download_if_necessary;
+    use super::{download_if_necessary, url_to_cache_filename};
 
     #[test]
     fn download_rejects_invalid_hf_path() {
         let err = download_if_necessary("hf://too-short").unwrap_err();
         assert!(err.to_string().contains("Invalid hf:// path"));
+    }
+
+    #[test]
+    fn url_to_cache_filename_handles_special_chars() {
+        assert_eq!(
+            url_to_cache_filename("https://example.com/path/to/file.bin"),
+            "example.com_path_to_file.bin"
+        );
+        assert_eq!(
+            url_to_cache_filename("https://example.com/file?query=1&other=2"),
+            "example.com_file_query_1_other_2"
+        );
     }
 }

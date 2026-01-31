@@ -16,8 +16,6 @@ path = "src/main.rs"
 burn = { version = "0.20.1", features = ["ndarray"] }
 burn-nn = "0.20.1"
 burn-ndarray = "0.20.1"
-burn-cpu = { version = "0.20.1", optional = true, default-features = false, features = ["std"] }
-burn-wgpu = { version = "0.20.1", optional = true, default-features = false, features = ["std", "vulkan"] }
 safetensors = "0.4"
 hf-hub = "0.3"
 sentencepiece = "0.13.1"
@@ -31,6 +29,7 @@ rand = "0.8"
 anyhow = "1"
 tracing = "0.1"
 ctrlc = "3"
+ureq = "2"
 
 [dev-dependencies]
 proptest = "1"
@@ -39,7 +38,4 @@ serde_json = "1"
 nix = { version = "0.28", default-features = false, features = ["signal"] }
 
 [features]
-default = ["backend-ndarray"]
-backend-ndarray = []
-backend-cpu = ["dep:burn-cpu"]
-backend-wgpu = ["dep:burn-wgpu"]
+default = []

@@ -208,16 +208,13 @@ fn main() -> Result<()> {
         }
         Commands::Voices => {
             let all_voices = available_voices();
-            let mut found_any = false;
             for voice in &all_voices {
-                if resolve_voice_path(voice).is_some() {
+                let available = resolve_voice_path(voice).is_some();
+                if available {
                     println!("{voice}");
-                    found_any = true;
+                } else {
+                    println!("{voice} (not installed)");
                 }
-            }
-            if !found_any {
-                eprintln!("No predefined voices found. Use `guth voice encode` to create one.");
-                eprintln!("Voice files should be in pocket_tts/voices/ or voices/");
             }
         }
         Commands::Voice { command } => match command {
