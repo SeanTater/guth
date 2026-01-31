@@ -298,6 +298,21 @@ impl<B: Backend + 'static> TtsModel<B> {
         Ok(())
     }
 
+    /// Apply pre-computed voice conditioning to the model state.
+    ///
+    /// The conditioning tensor should be a 3D tensor of shape `[batch, seq, dim]`
+    /// where `dim` matches the transformer's d_model. This tensor is typically
+    /// created by `voice encode` command which encodes audio through mimi and
+    /// projects it with the speaker projection weight.
+    pub fn condition_on_precomputed(
+        &self,
+        conditioning: Tensor<B, 3>,
+        state: &mut TtsState<B>,
+    ) -> anyhow::Result<()> {
+        self.run_flow_lm_and_increment(state, None, None, Some(conditioning))?;
+        Ok(())
+    }
+
     fn run_flow_lm_and_increment(
         &self,
         state: &mut TtsState<B>,

@@ -111,9 +111,6 @@ fn main() -> Result<()> {
             stream,
             progress,
         } => {
-            if voice.is_some() {
-                anyhow::bail!("Predefined voices are not wired yet; use --voice-file for now.");
-            }
             let interrupted = Arc::new(AtomicBool::new(false));
             let interrupt_flag = Arc::clone(&interrupted);
             ctrlc::set_handler(move || {
@@ -150,7 +147,18 @@ fn main() -> Result<()> {
             let frames_after_eos = frames_after_eos.unwrap_or(frames_after_eos_guess);
             let mut state = tts.init_state(1, tokens.dims()[1] + max_gen_len + 1, max_gen_len, &device);
 
-            if let Some(voice_path) = voice_file {
+            // Apply voice conditioning if specified
+            if let Some(voice_name) = voice {
+                // Predefined voice - load pre-computed conditioning tensor
+                let voice_path = resolve_voice_path(&voice_name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Voice '{voice_name}' not found. Run `guth voices` to see available voices."
+                    )
+                })?;
+                let conditioning = load_conditioning_tensor(&voice_path, &device)?;
+                tts.condition_on_precomputed(conditioning, &mut state)?;
+            } else if let Some(voice_path) = voice_file {
+                // Custom voice file - compute conditioning from audio
                 let (samples, sample_rate) = WavIo::read_audio(&voice_path)?;
                 let prompt = AudioResampler::convert_audio(
                     samples,
@@ -199,8 +207,17 @@ fn main() -> Result<()> {
             }
         }
         Commands::Voices => {
-            for voice in available_voices() {
-                println!("{voice}");
+            let all_voices = available_voices();
+            let mut found_any = false;
+            for voice in &all_voices {
+                if resolve_voice_path(voice).is_some() {
+                    println!("{voice}");
+                    found_any = true;
+                }
+            }
+            if !found_any {
+                eprintln!("No predefined voices found. Use `guth voice encode` to create one.");
+                eprintln!("Voice files should be in pocket_tts/voices/ or voices/");
             }
         }
         Commands::Voice { command } => match command {
@@ -309,6 +326,44 @@ fn save_tensor(path: &PathBuf, name: &str, tensor: Tensor<NdArray<f32>, 3>) -> R
     let serialized = safetensors::serialize(&tensors, &None)?;
     std::fs::write(path, serialized)?;
     Ok(())
+}
+
+fn load_conditioning_tensor(
+    path: &PathBuf,
+    device: &NdArrayDevice,
+) -> Result<Tensor<NdArray<f32>, 3>> {
+    let data = std::fs::read(path)?;
+    let safetensors = safetensors::SafeTensors::deserialize(&data)?;
+    let tensor_view = safetensors
+        .tensor("conditioning")
+        .map_err(|e| anyhow::anyhow!("Failed to load conditioning tensor: {e}"))?;
+    let shape = tensor_view.shape();
+    if shape.len() != 3 {
+        anyhow::bail!("Expected 3D tensor, got {}D", shape.len());
+    }
+    let mut values = Vec::with_capacity(tensor_view.data().len() / 4);
+    for chunk in tensor_view.data().chunks_exact(4) {
+        values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    Ok(Tensor::from_data(
+        TensorData::new(values, [shape[0], shape[1], shape[2]]),
+        device,
+    ))
+}
+
+fn resolve_voice_path(voice_name: &str) -> Option<PathBuf> {
+    // Try multiple locations for voice files
+    let candidates = [
+        format!("pocket_tts/voices/{voice_name}.safetensors"),
+        format!("voices/{voice_name}.safetensors"),
+    ];
+    for candidate in candidates {
+        let path = PathBuf::from(&candidate);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn available_models() -> Vec<&'static str> {
