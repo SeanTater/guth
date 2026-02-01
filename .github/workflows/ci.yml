@@ -11,6 +11,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install system dependencies
+        run: |
+          if command -v sudo >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y cmake jq pkg-config
+          else
+            apt-get update
+            apt-get install -y cmake jq pkg-config
+          fi
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

@@ -3,6 +3,7 @@
 //! This module implements the flow-matching transformer used to predict latent
 //! codec frames. It also handles weight loading from Python-style checkpoints.
 
+use crate::state::StreamingModule;
 use crate::{
     conditioner::text::LutConditioner,
     config::FlowLmConfig,
@@ -17,7 +18,6 @@ use crate::{
     },
     weights::TensorData as WeightTensor,
 };
-use crate::state::StreamingModule;
 use burn::{
     module::Param,
     tensor::{

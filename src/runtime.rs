@@ -124,15 +124,17 @@ impl<B: Backend + 'static> TtsRuntime<B> {
         let tokens = tokens.into_iter().map(|v| v as i64).collect::<Vec<_>>();
         let device = self.model.flow_lm.bos_emb.device();
         let tokens_len = tokens.len();
-        let tokens = Tensor::<B, 2, Int>::from_data(
-            TensorData::new(tokens, [1, tokens_len]),
-            &device,
-        );
+        let tokens =
+            Tensor::<B, 2, Int>::from_data(TensorData::new(tokens, [1, tokens_len]), &device);
         Ok((tokens, frames_after_eos))
     }
 
     /// Initialize generation state sized for the provided tokens and max length.
-    pub fn init_state_for_tokens(&self, tokens: &Tensor<B, 2, Int>, max_gen_len: usize) -> TtsState<B> {
+    pub fn init_state_for_tokens(
+        &self,
+        tokens: &Tensor<B, 2, Int>,
+        max_gen_len: usize,
+    ) -> TtsState<B> {
         let device = tokens.device();
         let flow_len = tokens.dims()[1] + max_gen_len + 1;
         self.model
@@ -246,10 +248,7 @@ impl<B: Backend + 'static> TtsRuntime<B> {
 }
 
 /// Convert per-channel samples into a `[1, channels, samples]` tensor.
-fn tensor_from_audio<B: Backend>(
-    samples: Vec<Vec<f32>>,
-    device: &B::Device,
-) -> Tensor<B, 3> {
+fn tensor_from_audio<B: Backend>(samples: Vec<Vec<f32>>, device: &B::Device) -> Tensor<B, 3> {
     let channels = samples.len();
     let len = samples[0].len();
     let mut flat = Vec::with_capacity(channels * len);

@@ -47,7 +47,11 @@ pub fn download_if_necessary(path: &str) -> Result<PathBuf> {
         return download_http(path);
     }
 
-    Ok(PathBuf::from(path))
+    let local = PathBuf::from(path);
+    if !local.exists() {
+        anyhow::bail!("No such file or directory: {path}");
+    }
+    Ok(local)
 }
 
 /// Download a file from an HTTP(S) URL to the cache directory.
@@ -132,6 +136,18 @@ mod tests {
     fn download_rejects_invalid_hf_path() {
         let err = download_if_necessary("hf://too-short").unwrap_err();
         assert!(err.to_string().contains("Invalid hf:// path"));
+    }
+
+    #[test]
+    fn download_accepts_existing_local_path() {
+        let path = download_if_necessary("tests/fixtures/tokenizer.model").unwrap();
+        assert!(path.ends_with("tests/fixtures/tokenizer.model"));
+    }
+
+    #[test]
+    fn download_rejects_missing_local_path() {
+        let err = download_if_necessary("tests/fixtures/missing_local_file.bin").unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("no such file"));
     }
 
     #[test]

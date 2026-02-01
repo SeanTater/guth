@@ -5,9 +5,7 @@
 
 use burn::{
     module::Param,
-    tensor::{
-        activation::silu, backend::Backend, Tensor, TensorData as BurnTensorData,
-    },
+    tensor::{activation::silu, backend::Backend, Tensor, TensorData as BurnTensorData},
 };
 use burn_nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig};
 
@@ -403,7 +401,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::{module::Param, tensor::{TensorData as BurnTensorData, Tolerance}};
+    use burn::{
+        module::Param,
+        tensor::{TensorData as BurnTensorData, Tolerance},
+    };
     use burn_ndarray::{NdArray, NdArrayDevice};
     use serde::Deserialize;
     use std::fs;
@@ -578,7 +579,10 @@ mod tests {
 
     /// Assign fixture weights to an RMSNorm.
     fn apply_rms(norm: &mut RmsNorm<TestBackend>, weights: &[f32], device: &NdArrayDevice) {
-        let gamma = Tensor::from_data(BurnTensorData::new(weights.to_vec(), [weights.len()]), device);
+        let gamma = Tensor::from_data(
+            BurnTensorData::new(weights.to_vec(), [weights.len()]),
+            device,
+        );
         norm.gamma = Param::from_tensor(gamma);
     }
 

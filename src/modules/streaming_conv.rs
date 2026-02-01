@@ -30,9 +30,7 @@ pub struct StreamingConvState<B: Backend> {
 impl<B: Backend> Default for StreamingConvState<B> {
     /// Create an empty streaming state with no history.
     fn default() -> Self {
-        Self {
-            history: None,
-        }
+        Self { history: None }
     }
 }
 

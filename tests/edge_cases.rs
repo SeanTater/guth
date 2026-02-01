@@ -23,7 +23,6 @@ fn fallback_weights_disable_voice_cloning() {
         Some("tests/fixtures/tts_state.safetensors".to_string());
 
     let device = NdArrayDevice::default();
-    let model =
-        TtsModel::<NdArray<f32>>::from_config(&config, 0.0, 2, None, 0.0, &device).unwrap();
+    let model = TtsModel::<NdArray<f32>>::from_config(&config, 0.0, 2, None, 0.0, &device).unwrap();
     assert!(!model.voice_cloning_supported);
 }

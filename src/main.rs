@@ -14,7 +14,7 @@ use guth::config::load_config;
 use guth::runtime::{RuntimeParams, TtsRuntime};
 use safetensors::Dtype;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -209,11 +209,7 @@ fn main() -> Result<()> {
                     max_gen_len,
                     frames_after_eos,
                 );
-                let mut writer = StreamingWavWriter::create(
-                    output_path,
-                    sample_rate,
-                    channels,
-                )?;
+                let mut writer = StreamingWavWriter::create(output_path, sample_rate, channels)?;
                 for (chunk_idx, chunk) in receiver.into_iter().enumerate() {
                     if interrupted.load(Ordering::SeqCst) {
                         writer.finalize()?;
@@ -316,7 +312,7 @@ fn audio_to_vec(audio: Tensor<NdArray<f32>, 3>) -> Vec<Vec<f32>> {
 }
 
 /// Save a 3D tensor to a SafeTensors file.
-fn save_tensor(path: &PathBuf, name: &str, tensor: Tensor<NdArray<f32>, 3>) -> Result<()> {
+fn save_tensor(path: &Path, name: &str, tensor: Tensor<NdArray<f32>, 3>) -> Result<()> {
     let data = tensor.to_data();
     let values = data.as_slice::<f32>().expect("tensor data");
     let mut bytes = Vec::with_capacity(values.len() * 4);
@@ -331,7 +327,7 @@ fn save_tensor(path: &PathBuf, name: &str, tensor: Tensor<NdArray<f32>, 3>) -> R
     Ok(())
 }
 
-fn is_safetensors_path(path: &PathBuf) -> bool {
+fn is_safetensors_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"))
@@ -339,7 +335,7 @@ fn is_safetensors_path(path: &PathBuf) -> bool {
 
 /// Load a conditioning tensor from a SafeTensors file.
 fn load_conditioning_tensor(
-    path: &PathBuf,
+    path: &Path,
     device: &NdArrayDevice,
 ) -> Result<Tensor<NdArray<f32>, 3>> {
     let data = std::fs::read(path)?;

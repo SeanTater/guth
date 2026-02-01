@@ -143,8 +143,10 @@ fn map_flow_lm_name(name: &str) -> Option<String> {
         ),
     ];
 
-    if FLOW_SKIP_EXACT.iter().any(|skip| *skip == name)
-        || FLOW_SKIP_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+    if FLOW_SKIP_EXACT.contains(&name)
+        || FLOW_SKIP_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
     {
         return None;
     }
@@ -178,8 +180,10 @@ fn map_mimi_name(name: &str) -> Option<String> {
 
     let name = name.strip_prefix("model.").unwrap_or(name);
 
-    if MIMI_SKIP_EXACT.iter().any(|skip| *skip == name)
-        || MIMI_SKIP_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+    if MIMI_SKIP_EXACT.contains(&name)
+        || MIMI_SKIP_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
     {
         return None;
     }
