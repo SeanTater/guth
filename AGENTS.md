@@ -95,7 +95,7 @@ This is a pure Python package with Rust extensions in `training/rust_exts/audio_
 - **Parity fixtures**: generate one-off fixtures with Python (via `uv run --with ...`); never run Python during Rust tests.
 - **Audits**: keep plan/audit notes up to date as work proceeds.
 - **Plans not checked in**: `.plans/` is ignored; update locally but don’t commit unless explicitly asked.
-- **Scratch space**: put temporary files and cloned repos in `/scratch/` (ignored by git).
+- **Scratch space**: put temporary files and cloned repos in `./scratch/` (repo-root, ignored by git).
 - **Commit/push cadence**: commit and push at each meaningful step (tests first, then implementation).
 - **Commit size**: aim to keep commits under 1000 LOC by committing more frequently.
 
@@ -105,22 +105,22 @@ Use a separate worktree + branch per agent to isolate working files and build ar
 
 Naming convention (descriptive + timestamp):
 - Branch: `agent/<name>-<topic>-YYYYMMDD-HHMM`
-- Worktree dir: `/scratch/pocket-tts-<name>-<topic>-YYYYMMDD-HHMM`
-- Target dir: `/scratch/target/pocket-tts-<name>-<topic>-YYYYMMDD-HHMM`
+- Worktree dir: `./scratch/pocket-tts-<name>-<topic>-YYYYMMDD-HHMM`
+- Target dir: `./scratch/target/pocket-tts-<name>-<topic>-YYYYMMDD-HHMM`
 
 ```bash
 # Create per-agent worktrees
-git worktree add /scratch/pocket-tts-jasmine-ci-fix-20260201-1430 -b agent/jasmine-ci-fix-20260201-1430
-git worktree add /scratch/pocket-tts-kyle-docs-20260201-1445 -b agent/kyle-docs-20260201-1445
+git worktree add ./scratch/pocket-tts-jasmine-ci-fix-20260201-1430 -b agent/jasmine-ci-fix-20260201-1430
+git worktree add ./scratch/pocket-tts-kyle-docs-20260201-1445 -b agent/kyle-docs-20260201-1445
 
 # In each worktree, keep build outputs separate
-export CARGO_TARGET_DIR=/scratch/target/pocket-tts-jasmine-ci-fix-20260201-1430
+export CARGO_TARGET_DIR=./scratch/target/pocket-tts-jasmine-ci-fix-20260201-1430
 
 # Optional: clean up the target dir when finished (these can be 100+ GB)
-rm -rf /scratch/target/pocket-tts-jasmine-ci-fix-20260201-1430
+rm -rf ./scratch/target/pocket-tts-jasmine-ci-fix-20260201-1430
 
 # Remove a worktree when done
-git worktree remove /scratch/pocket-tts-jasmine-ci-fix-20260201-1430
+git worktree remove ./scratch/pocket-tts-jasmine-ci-fix-20260201-1430
 ```
 
 Notes:
