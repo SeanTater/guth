@@ -18,6 +18,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+const VOICE_CLONING_UNSUPPORTED: &str = "Voice cloning weights are unavailable. \
+Use --voice with a built-in voice, or download the full weights for voice cloning.";
+
 /// Top-level CLI options.
 #[derive(Parser)]
 #[command(name = "guth")]
@@ -38,7 +41,7 @@ enum Commands {
         /// Name of a precomputed voice embedding.
         #[arg(long)]
         voice: Option<String>,
-        /// Path to a custom voice audio file.
+        /// Path to a custom voice audio file or voice prompt safetensors.
         #[arg(long)]
         voice_file: Option<PathBuf>,
         /// Output WAV file path.
@@ -184,8 +187,16 @@ fn main() -> Result<()> {
                 let conditioning = load_conditioning_tensor(&voice_path, &device)?;
                 runtime.condition_on_precomputed(conditioning, &mut state)?;
             } else if let Some(voice_path) = voice_file {
-                // Custom voice file - compute conditioning from audio
-                runtime.condition_on_audio_path(&voice_path, &mut state)?;
+                if !runtime.voice_cloning_supported() {
+                    anyhow::bail!(VOICE_CLONING_UNSUPPORTED);
+                }
+                // Custom voice file - compute conditioning from audio or load safetensors.
+                if is_safetensors_path(&voice_path) {
+                    let conditioning = load_conditioning_tensor(&voice_path, &device)?;
+                    runtime.condition_on_precomputed(conditioning, &mut state)?;
+                } else {
+                    runtime.condition_on_audio_path(&voice_path, &mut state)?;
+                }
             }
 
             let output_path = output.ok_or_else(|| anyhow::anyhow!("--output is required"))?;
@@ -253,8 +264,11 @@ fn main() -> Result<()> {
                     params,
                     &device,
                 )?;
+                if !runtime.voice_cloning_supported() {
+                    anyhow::bail!(VOICE_CLONING_UNSUPPORTED);
+                }
                 let conditioning = runtime.conditioning_from_audio_path(input)?;
-                save_tensor(&output, "conditioning", conditioning)?;
+                save_tensor(&output, "audio_prompt", conditioning)?;
             }
         },
         Commands::Models => {
@@ -317,6 +331,12 @@ fn save_tensor(path: &PathBuf, name: &str, tensor: Tensor<NdArray<f32>, 3>) -> R
     Ok(())
 }
 
+fn is_safetensors_path(path: &PathBuf) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"))
+}
+
 /// Load a conditioning tensor from a SafeTensors file.
 fn load_conditioning_tensor(
     path: &PathBuf,
@@ -324,9 +344,12 @@ fn load_conditioning_tensor(
 ) -> Result<Tensor<NdArray<f32>, 3>> {
     let data = std::fs::read(path)?;
     let safetensors = safetensors::SafeTensors::deserialize(&data)?;
-    let tensor_view = safetensors
-        .tensor("audio_prompt")
-        .map_err(|e| anyhow::anyhow!("Failed to load conditioning tensor: {e}"))?;
+    let tensor_view = match safetensors.tensor("audio_prompt") {
+        Ok(tensor) => tensor,
+        Err(_) => safetensors
+            .tensor("conditioning")
+            .map_err(|e| anyhow::anyhow!("Failed to load conditioning tensor: {e}"))?,
+    };
     let shape = tensor_view.shape();
     if shape.len() != 3 {
         anyhow::bail!("Expected 3D tensor, got {}D", shape.len());

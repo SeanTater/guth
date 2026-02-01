@@ -32,3 +32,9 @@ repos:
       language: system
       types: [rust]
       pass_filenames: false
+    - id: rust-coverage
+      name: rust coverage (no regressions)
+      entry: scripts/coverage/rust_coverage.sh --baseline-file coverage-baseline-rs.txt --quiet
+      language: system
+      types: [rust]
+      pass_filenames: false

@@ -30,3 +30,14 @@ jobs:
 
       - name: Cargo test
         run: cargo test
+
+      - name: Install llvm-tools-preview
+        run: rustup component add llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Rust coverage
+        run: scripts/coverage/rust_coverage.sh --min 50 --baseline-file coverage-baseline-rs.txt

@@ -105,6 +105,11 @@ impl<B: Backend + 'static> TtsRuntime<B> {
         &self.model
     }
 
+    /// Returns true when speaker projection weights are available.
+    pub fn voice_cloning_supported(&self) -> bool {
+        self.model.voice_cloning_supported
+    }
+
     /// Prepare text into tokens and a suggested `frames_after_eos`.
     pub fn prepare_tokens(&self, text: &str) -> Result<(Tensor<B, 2, Int>, usize)> {
         let tokenizer = self

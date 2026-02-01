@@ -74,6 +74,15 @@ runtime.condition_on_audio_path("voice.wav", &mut state)?;
 let receiver = runtime.generate_audio_stream_with_state(tokens, state, 256, frames_after_eos);
 ```
 
+### CLI Voice Prompts
+
+You can precompute a voice prompt and reuse it in the CLI:
+
+```bash
+guth voice encode --input voice.wav --output voice.safetensors --config python/pocket_tts/config/b6369a24.yaml
+guth say "Hello." --voice-file voice.safetensors --output out.wav --config python/pocket_tts/config/b6369a24.yaml
+```
+
 ## Configuration
 
 Models are configured via YAML files. Weight paths support:

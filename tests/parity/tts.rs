@@ -422,6 +422,7 @@ fn build_tts_model(fixture: &TtsFixture, device: &NdArrayDevice) -> TtsModel<Tes
         flow_lm,
         mimi,
         speaker_proj_weight,
+        true,
         fixture.generation.temp,
         fixture.generation.lsd_decode_steps,
         fixture.generation.noise_clamp,

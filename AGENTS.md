@@ -99,6 +99,37 @@ This is a pure Python package with Rust extensions in `training/rust_exts/audio_
 - **Commit/push cadence**: commit and push at each meaningful step (tests first, then implementation).
 - **Commit size**: aim to keep commits under 1000 LOC by committing more frequently.
 
+### Multi-Agent Workflow (Avoiding Contention)
+
+Use a separate worktree + branch per agent to isolate working files and build artifacts.
+
+Naming convention (descriptive + timestamp):
+- Branch: `agent/<name>-<topic>-YYYYMMDD-HHMM`
+- Worktree dir: `/scratch/pocket-tts-<name>-<topic>-YYYYMMDD-HHMM`
+- Target dir: `/scratch/target/pocket-tts-<name>-<topic>-YYYYMMDD-HHMM`
+
+```bash
+# Create per-agent worktrees
+git worktree add /scratch/pocket-tts-jasmine-ci-fix-20260201-1430 -b agent/jasmine-ci-fix-20260201-1430
+git worktree add /scratch/pocket-tts-kyle-docs-20260201-1445 -b agent/kyle-docs-20260201-1445
+
+# In each worktree, keep build outputs separate
+export CARGO_TARGET_DIR=/scratch/target/pocket-tts-jasmine-ci-fix-20260201-1430
+
+# Optional: clean up the target dir when finished (these can be 100+ GB)
+rm -rf /scratch/target/pocket-tts-jasmine-ci-fix-20260201-1430
+
+# Remove a worktree when done
+git worktree remove /scratch/pocket-tts-jasmine-ci-fix-20260201-1430
+```
+
+Notes:
+- Branches isolate commits; worktrees isolate files. Use both for multi-agent safety.
+- Keep `CARGO_TARGET_DIR` per agent to avoid cross-agent test/build conflicts.
+- If you run multiple agents on one machine, do not share a worktree directory.
+- Each agent should pick a new, distinct name not already used in existing worktrees, and use that name in their branch/worktree naming and in messages (refer to themselves by name).
+- Preferred landing flow: rebase your agent branch onto latest `main`, then fast-forward merge into `main`.
+
 ### Key Patterns
 
 1. **Streaming Generation**: The model generates audio frame-by-frame (12.5 Hz frame rate, 80ms per frame). All modules inherit from `StatefulModule` to maintain internal state.

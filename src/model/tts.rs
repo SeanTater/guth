@@ -52,6 +52,7 @@ pub struct TtsModel<B: Backend> {
     pub flow_lm: FlowLmModel<B>,
     pub mimi: MimiModel<B>,
     pub speaker_proj_weight: Tensor<B, 2>,
+    pub voice_cloning_supported: bool,
     pub temp: f32,
     pub lsd_decode_steps: usize,
     pub noise_clamp: Option<f32>,
@@ -67,6 +68,7 @@ impl<B: Backend + 'static> TtsModel<B> {
         flow_lm: FlowLmModel<B>,
         mimi: MimiModel<B>,
         speaker_proj_weight: Tensor<B, 2>,
+        voice_cloning_supported: bool,
         temp: f32,
         lsd_decode_steps: usize,
         noise_clamp: Option<f32>,
@@ -76,6 +78,7 @@ impl<B: Backend + 'static> TtsModel<B> {
             flow_lm,
             mimi,
             speaker_proj_weight,
+            voice_cloning_supported,
             temp,
             lsd_decode_steps,
             noise_clamp,
@@ -111,12 +114,15 @@ impl<B: Backend + 'static> TtsModel<B> {
         let mut mimi = MimiModel::from_config(&config.mimi, device);
 
         let mut speaker_proj_weight = Tensor::<B, 2>::zeros([flow_lm.dim, flow_lm.ldim], device);
+        let mut voice_cloning_supported = false;
 
         if let Some(weights_path) = config.weights_path.as_ref() {
+            let mut used_fallback = false;
             let weights_path = match download_if_necessary(weights_path) {
                 Ok(path) => path,
                 Err(err) => {
                     if let Some(fallback) = config.weights_path_without_voice_cloning.as_ref() {
+                        used_fallback = true;
                         download_if_necessary(fallback)?
                     } else {
                         return Err(err);
@@ -132,14 +138,20 @@ impl<B: Backend + 'static> TtsModel<B> {
             }
             if let Some(weight) = tts_state.speaker_proj_weight {
                 speaker_proj_weight = tensor2_from_data(&weight, device)?;
+                voice_cloning_supported = true;
             } else if let Some(weight) = tts_state.flow_lm.get("speaker_proj_weight") {
                 speaker_proj_weight = tensor2_from_data(weight, device)?;
+                voice_cloning_supported = true;
+            }
+            if used_fallback {
+                voice_cloning_supported = false;
             }
             let speaker_proj_weight = speaker_proj_weight.transpose();
             return Ok(Self::new(
                 flow_lm,
                 mimi,
                 speaker_proj_weight,
+                voice_cloning_supported,
                 temp,
                 lsd_decode_steps,
                 noise_clamp,
@@ -158,6 +170,7 @@ impl<B: Backend + 'static> TtsModel<B> {
             flow_lm.load_state_dict(&flow_state, device)?;
             if let Some(weight) = flow_state.get("speaker_proj_weight") {
                 speaker_proj_weight = tensor2_from_data(weight, device)?;
+                voice_cloning_supported = true;
             }
         }
 
@@ -177,6 +190,7 @@ impl<B: Backend + 'static> TtsModel<B> {
             flow_lm,
             mimi,
             speaker_proj_weight,
+            voice_cloning_supported,
             temp,
             lsd_decode_steps,
             noise_clamp,
