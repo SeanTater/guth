@@ -27,6 +27,7 @@ Supports Python 3.10, 3.11, 3.12, 3.13 and 3.14. Requires PyTorch 2.5+. Does not
 * English only at the moment
 * Can handle infinitely long text inputs
 * [Can run on client-side in the browser](#in-browser-implementations)
+* TODO (Rust rewrite): only the ndarray backend is supported for now; CPU/WGPU backends are disabled until they’re validated.
 
 ## Trying it from the website, without installing anything
 
