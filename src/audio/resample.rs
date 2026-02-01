@@ -1,12 +1,19 @@
+//! Sample rate and channel conversion helpers for audio prompts.
+//!
+//! These utilities are used to adapt user-provided audio to the model's expected
+//! sample rate and channel count.
+
 use anyhow::Result;
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 
+/// Resampler with simple channel conversion.
 #[derive(Debug, Default)]
 pub struct AudioResampler;
 
 impl AudioResampler {
+    /// Convert samples to the desired sample rate and number of channels.
     pub fn convert_audio(
         mut samples: Vec<Vec<f32>>,
         from_rate: u32,
@@ -34,6 +41,7 @@ impl AudioResampler {
     }
 }
 
+/// Convert channel count by mixing down or duplicating channels.
 fn convert_channels(samples: Vec<Vec<f32>>, to_channels: usize) -> Result<Vec<Vec<f32>>> {
     if samples.is_empty() {
         return Ok(samples);

@@ -2,10 +2,13 @@
 name = "guth"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 description = "Fast CPU-optimized text-to-speech library using flow matching"
 authors = ["Kyutai Labs"]
 repository = "https://github.com/kyutai-labs/pocket-tts"
+homepage = "https://github.com/kyutai-labs/pocket-tts"
+documentation = "https://docs.rs/guth"
 keywords = ["tts", "text-to-speech", "audio", "machine-learning"]
 categories = ["multimedia::audio", "science"]
 readme = "README.md"
@@ -31,7 +34,7 @@ burn = { version = "0.20.1", features = ["ndarray"] }
 burn-nn = "0.20.1"
 burn-ndarray = "0.20.1"
 safetensors = "0.4"
-hf-hub = "0.3"
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
 sentencepiece = "0.13.1"
 hound = "3.5"
 rubato = "0.15"
@@ -43,7 +46,7 @@ rand = "0.8"
 anyhow = "1"
 tracing = "0.1"
 ctrlc = "3"
-ureq = "2"
+ureq = { version = "2", default-features = false, features = ["rustls", "gzip"] }
 
 [dev-dependencies]
 proptest = "1"
@@ -56,3 +59,34 @@ default = []
 backend-cpu = []
 backend-ndarray = []
 backend-wgpu = []
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.zip"
+pkg-fmt = "zip"
+
+[package.metadata.deb]
+maintainer = "Kyutai Labs <contact@kyutai.org>"
+copyright = "2024-2025, Kyutai Labs"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+guth is a fast, CPU-optimized text-to-speech CLI using flow matching. \
+It supports streaming generation, voice cloning, and runs efficiently \
+without requiring a GPU."""
+depends = "$auto"
+section = "sound"
+priority = "optional"
+assets = [
+    ["target/release/guth", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/guth/", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/guth", dest = "/usr/bin/guth", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/guth/README.md", mode = "644" },
+]

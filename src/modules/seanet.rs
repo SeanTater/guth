@@ -1,32 +1,40 @@
+//! SEANet encoder/decoder layers used by the Mimi codec.
+//!
+//! SEANet is a convolutional architecture that maps waveforms to latent frames
+//! and back. Here we implement a streaming-friendly version with explicit state.
+
 use crate::modules::streaming_conv::{
     StreamingConv1dOp, StreamingConvState, StreamingConvTranspose1dOp,
 };
-use crate::state::StreamStep;
 use anyhow::Result;
-use burn::tensor::backend::Backend;
-use burn::tensor::Tensor;
+use burn::tensor::{backend::Backend, Tensor};
 
+/// Simple ELU implementation with configurable alpha.
 fn elu<B: Backend>(input: Tensor<B, 3>, alpha: f32) -> Tensor<B, 3> {
     let mask = input.clone().greater_equal_elem(0.0);
     let neg = input.clone().exp().sub_scalar(1.0).mul_scalar(alpha);
     neg.mask_where(mask, input)
 }
 
+/// Residual block composed of streaming convolution layers.
 #[derive(Debug, Clone)]
 pub struct SeanetResnetBlock<B: Backend> {
     pub(crate) convs: Vec<StreamingConv1dOp<B>>,
 }
 
+/// Streaming state for a SEANet residual block.
 #[derive(Debug, Clone)]
 pub struct SeanetResnetBlockState<B: Backend> {
     convs: Vec<StreamingConvState<B>>,
 }
 
 impl<B: Backend> SeanetResnetBlock<B> {
+    /// Create a residual block from its convolution layers.
     pub fn new(convs: Vec<StreamingConv1dOp<B>>) -> Self {
         Self { convs }
     }
 
+    /// Initialize streaming state for this block.
     pub fn init_state(&self, batch_size: usize) -> SeanetResnetBlockState<B> {
         SeanetResnetBlockState {
             convs: self
@@ -37,6 +45,7 @@ impl<B: Backend> SeanetResnetBlock<B> {
         }
     }
 
+    /// Forward pass through the residual block.
     pub fn forward(
         &self,
         input: Tensor<B, 3>,
@@ -51,52 +60,69 @@ impl<B: Backend> SeanetResnetBlock<B> {
     }
 }
 
+/// Layer variants used in the SEANet encoder/decoder.
 #[derive(Debug, Clone)]
 pub enum SeanetLayer<B: Backend> {
+    /// Nonlinear activation.
     Elu,
+    /// Standard convolution.
     Conv1d(StreamingConv1dOp<B>),
+    /// Transposed convolution.
     ConvTranspose1d(StreamingConvTranspose1dOp<B>),
+    /// Residual block.
     ResBlock(SeanetResnetBlock<B>),
 }
 
+/// Streaming state variants for SEANet layers.
 #[derive(Debug, Clone)]
 pub enum SeanetLayerState<B: Backend> {
+    /// No state needed.
     None,
+    /// Streaming state for Conv1d.
     Conv1d(StreamingConvState<B>),
+    /// Streaming state for ConvTranspose1d.
     ConvTranspose1d(StreamingConvState<B>),
+    /// Streaming state for a residual block.
     ResBlock(SeanetResnetBlockState<B>),
 }
 
+/// Streaming state for a full SEANet stack.
 #[derive(Debug, Clone)]
 pub struct SeanetState<B: Backend> {
     layers: Vec<SeanetLayerState<B>>,
 }
 
 impl<B: Backend> SeanetState<B> {
+    /// Create a state container from layer states.
     fn new(layers: Vec<SeanetLayerState<B>>) -> Self {
         Self { layers }
     }
 }
 
+/// SEANet encoder (audio -> latents).
 #[derive(Debug, Clone)]
 pub struct SeanetEncoder<B: Backend> {
     pub(crate) layers: Vec<SeanetLayer<B>>,
 }
 
+/// SEANet decoder (latents -> audio).
 #[derive(Debug, Clone)]
 pub struct SeanetDecoder<B: Backend> {
     pub(crate) layers: Vec<SeanetLayer<B>>,
 }
 
 impl<B: Backend> SeanetEncoder<B> {
+    /// Construct an encoder from its layer list.
     pub fn new(layers: Vec<SeanetLayer<B>>) -> Self {
         Self { layers }
     }
 
+    /// Initialize streaming state for the encoder.
     pub fn init_state(&self, batch_size: usize) -> SeanetState<B> {
         SeanetState::new(init_layer_states(&self.layers, batch_size))
     }
 
+    /// Forward pass through the encoder.
     pub fn forward(
         &self,
         mut input: Tensor<B, 3>,
@@ -110,14 +136,17 @@ impl<B: Backend> SeanetEncoder<B> {
 }
 
 impl<B: Backend> SeanetDecoder<B> {
+    /// Construct a decoder from its layer list.
     pub fn new(layers: Vec<SeanetLayer<B>>) -> Self {
         Self { layers }
     }
 
+    /// Initialize streaming state for the decoder.
     pub fn init_state(&self, batch_size: usize) -> SeanetState<B> {
         SeanetState::new(init_layer_states(&self.layers, batch_size))
     }
 
+    /// Forward pass through the decoder.
     pub fn forward(
         &self,
         mut input: Tensor<B, 3>,
@@ -130,6 +159,7 @@ impl<B: Backend> SeanetDecoder<B> {
     }
 }
 
+/// Build streaming states for each layer in a SEANet stack.
 fn init_layer_states<B: Backend>(
     layers: &[SeanetLayer<B>],
     batch_size: usize,
@@ -151,6 +181,7 @@ fn init_layer_states<B: Backend>(
         .collect()
 }
 
+/// Initialize streaming state for a Conv1d layer.
 fn init_conv_state<B: Backend>(
     conv: &StreamingConv1dOp<B>,
     batch_size: usize,
@@ -165,10 +196,10 @@ fn init_conv_state<B: Backend>(
     let device = conv.weight.device();
     let history = Tensor::zeros([batch_size, in_channels, history_len], &device);
     state.history = Some(history);
-    state.step = StreamStep::new();
     state
 }
 
+/// Initialize streaming state for a ConvTranspose1d layer.
 fn init_conv_transpose_state<B: Backend>(
     conv: &StreamingConvTranspose1dOp<B>,
     batch_size: usize,
@@ -182,10 +213,10 @@ fn init_conv_transpose_state<B: Backend>(
     let device = conv.weight.device();
     let history = Tensor::zeros([batch_size, out_channels, history_len], &device);
     state.history = Some(history);
-    state.step = StreamStep::new();
     state
 }
 
+/// Apply a single SEANet layer to the input, using its matching state.
 fn apply_layer<B: Backend>(
     layer: &SeanetLayer<B>,
     state: &mut SeanetLayerState<B>,
@@ -210,7 +241,7 @@ fn apply_layer<B: Backend>(
 mod tests {
     use super::*;
     use crate::modules::streaming_conv::{PaddingMode, StreamingConvConfig};
-    use burn::tensor::{TensorData, Tolerance};
+    use burn::tensor::{TensorData as BurnTensorData, Tolerance};
     use burn_ndarray::{NdArray, NdArrayDevice};
     use serde::Deserialize;
     use std::fs;
@@ -220,6 +251,7 @@ mod tests {
 
     #[allow(dead_code)]
     #[derive(Debug, Deserialize)]
+    /// Full SEANet fixture with config, inputs, layers, and outputs.
     struct SeanetFixture {
         config: SeanetConfigFixture,
         input: Vec<Vec<Vec<f32>>>,
@@ -229,6 +261,7 @@ mod tests {
 
     #[allow(dead_code)]
     #[derive(Debug, Deserialize)]
+    /// Minimal SEANet config values stored in fixtures.
     struct SeanetConfigFixture {
         channels: usize,
         dimension: usize,
@@ -245,6 +278,7 @@ mod tests {
 
     #[derive(Debug, Deserialize)]
     #[serde(tag = "kind")]
+    /// Layer description used in JSON fixtures.
     enum LayerFixture {
         #[serde(rename = "elu")]
         Elu,
@@ -265,6 +299,7 @@ mod tests {
     }
 
     #[derive(Debug, Deserialize, Clone)]
+    /// Convolution layer parameters used inside fixtures.
     struct ConvLayerFixture {
         config: ConvConfigFixture,
         weight: Vec<Vec<Vec<f32>>>,
@@ -272,6 +307,7 @@ mod tests {
     }
 
     #[derive(Debug, Deserialize, Clone)]
+    /// Streaming convolution config used in fixtures.
     struct ConvConfigFixture {
         kernel_size: usize,
         stride: usize,
@@ -281,6 +317,7 @@ mod tests {
         pad_mode: String,
     }
 
+    /// Resolve a fixture file path under `tests/fixtures`.
     fn fixture_path(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -288,25 +325,29 @@ mod tests {
             .join(name)
     }
 
+    /// Load a SEANet fixture JSON file.
     fn load_fixture(name: &str) -> SeanetFixture {
         let data = fs::read_to_string(fixture_path(name)).expect("fixture read");
         serde_json::from_str(&data).expect("fixture parse")
     }
 
+    /// Build a 3D tensor from nested vectors.
     fn tensor3(device: &NdArrayDevice, data: Vec<Vec<Vec<f32>>>) -> Tensor<TestBackend, 3> {
         let b = data.len();
         let c = data[0].len();
         let t = data[0][0].len();
         let flat: Vec<f32> = data.into_iter().flatten().flatten().collect();
-        let td = TensorData::new(flat, [b, c, t]);
+        let td = BurnTensorData::new(flat, [b, c, t]);
         Tensor::from_data(td, device)
     }
 
+    /// Build a 1D tensor from a vector.
     fn tensor1(device: &NdArrayDevice, data: Vec<f32>) -> Tensor<TestBackend, 1> {
         let len = data.len();
-        Tensor::from_data(TensorData::new(data, [len]), device)
+        Tensor::from_data(BurnTensorData::new(data, [len]), device)
     }
 
+    /// Map fixture padding names to `PaddingMode`.
     fn pad_mode(name: &str) -> PaddingMode {
         match name {
             "replicate" | "Replicate" => PaddingMode::Replicate,
@@ -314,6 +355,7 @@ mod tests {
         }
     }
 
+    /// Build a streaming Conv1d from fixture weights.
     fn build_conv(
         fixture: &ConvLayerFixture,
         device: &NdArrayDevice,
@@ -335,6 +377,7 @@ mod tests {
         StreamingConv1dOp::new(config, weight, bias)
     }
 
+    /// Build a streaming ConvTranspose1d from fixture weights.
     fn build_conv_transpose(
         fixture: &ConvConfigFixture,
         weight: Vec<Vec<Vec<f32>>>,
@@ -358,6 +401,7 @@ mod tests {
         StreamingConvTranspose1dOp::new(config, weight, bias)
     }
 
+    /// Build the full list of SEANet layers from a fixture.
     fn build_layers(
         fixture: &SeanetFixture,
         device: &NdArrayDevice,

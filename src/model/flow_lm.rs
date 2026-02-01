@@ -1,21 +1,42 @@
-use crate::conditioner::text::LutConditioner;
-use crate::config::FlowLmConfig;
-use crate::download::download_if_necessary;
-use crate::modules::flow_net::{lsd_decode, SimpleMlpAdaLn};
-use crate::modules::linear::{apply_layer_norm_3d, apply_linear_3d};
-use crate::modules::transformer::{StreamingTransformer, StreamingTransformerState};
+//! FlowLM model: generates latent audio frames from text embeddings.
+//!
+//! This module implements the flow-matching transformer used to predict latent
+//! codec frames. It also handles weight loading from Python-style checkpoints.
+
+use crate::{
+    conditioner::text::LutConditioner,
+    config::FlowLmConfig,
+    download::download_if_necessary,
+    modules::{
+        flow_net::{lsd_decode, SimpleMlpAdaLn, SimpleMlpAdaLnConfig},
+        linear::{apply_layer_norm_3d, apply_linear_3d},
+        transformer::{
+            StreamingTransformer, StreamingTransformerConfig, StreamingTransformerLayerConfig,
+            StreamingTransformerState,
+        },
+    },
+    weights::TensorData as WeightTensor,
+};
 use crate::state::StreamingModule;
-use burn::tensor::backend::Backend;
-use burn::tensor::{Bool, Distribution, ElementConversion, Tensor, TensorData as BurnTensorData};
+use burn::{
+    module::Param,
+    tensor::{
+        backend::Backend, Bool, Distribution, ElementConversion, Tensor,
+        TensorData as BurnTensorData,
+    },
+};
 use burn_nn::{LayerNorm, Linear};
 use safetensors::Dtype;
 use std::collections::HashMap;
 
+/// Streaming state for the FlowLM transformer stack.
 #[derive(Debug)]
 pub struct FlowLmState<B: Backend> {
+    /// Transformer KV cache and position state.
     pub transformer: StreamingTransformerState<B>,
 }
 
+/// Flow-matching language model that predicts latent audio frames.
 #[derive(Debug)]
 pub struct FlowLmModel<B: Backend> {
     pub conditioner: LutConditioner<B>,
@@ -33,6 +54,7 @@ pub struct FlowLmModel<B: Backend> {
 
 impl<B: Backend + 'static> FlowLmModel<B> {
     #[allow(clippy::too_many_arguments)]
+    /// Construct a FlowLM model from pre-built components.
     pub fn new(
         conditioner: LutConditioner<B>,
         flow_net: SimpleMlpAdaLn<B>,
@@ -61,11 +83,13 @@ impl<B: Backend + 'static> FlowLmModel<B> {
         }
     }
 
+    /// Initialize streaming state for a given batch and sequence length.
     pub fn init_state(&self, batch_size: usize, sequence_length: usize) -> FlowLmState<B> {
         let transformer = self.transformer.init_state(batch_size, sequence_length);
         FlowLmState { transformer }
     }
 
+    /// Build a FlowLM model from config and allocate parameters on `device`.
     pub fn from_config(
         config: &FlowLmConfig,
         latent_dim: usize,
@@ -80,7 +104,7 @@ impl<B: Backend + 'static> FlowLmModel<B> {
             device,
         )?;
 
-        let mut flow_config = crate::modules::flow_net::SimpleMlpAdaLnConfig::new(
+        let mut flow_config = SimpleMlpAdaLnConfig::new(
             latent_dim,
             config.flow.dim as usize,
             latent_dim,
@@ -93,9 +117,9 @@ impl<B: Backend + 'static> FlowLmModel<B> {
 
         let ffn_dim = (config.transformer.d_model * config.transformer.hidden_scale) as usize;
         let transformer = StreamingTransformer::new(
-            crate::modules::transformer::StreamingTransformerConfig {
+            StreamingTransformerConfig {
                 num_layers: config.transformer.num_layers as usize,
-                layer: crate::modules::transformer::StreamingTransformerLayerConfig {
+                layer: StreamingTransformerLayerConfig {
                     d_model: config.transformer.d_model as usize,
                     num_heads: config.transformer.num_heads as usize,
                     ffn_dim,
@@ -139,6 +163,7 @@ impl<B: Backend + 'static> FlowLmModel<B> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Run the FlowLM forward pass and sample the next latent frame.
     pub fn forward(
         &self,
         sequence: Tensor<B, 3>,
@@ -162,13 +187,13 @@ impl<B: Backend + 'static> FlowLmModel<B> {
                 .repeat_dim(0, batch)
                 .repeat_dim(1, seq_len);
 
-            // Workaround for burn-ndarray issue: is_nan() doesn't detect NaN values correctly.
+            // WORKAROUND(BURN): burn-ndarray issue: is_nan() doesn't detect NaN values correctly.
             // Pull data to host, check for NaN manually, and create a mask tensor.
             let seq_data = sequence.clone().to_data();
             let seq_vals = seq_data.as_slice::<f32>().expect("sequence must be f32");
             let mask_vals: Vec<bool> = seq_vals.iter().map(|v| v.is_nan()).collect();
             let nan_mask = Tensor::<B, 3, Bool>::from_data(
-                burn::tensor::TensorData::new(mask_vals, sequence.dims()),
+                BurnTensorData::new(mask_vals, sequence.dims()),
                 &device,
             );
 
@@ -202,6 +227,7 @@ impl<B: Backend + 'static> FlowLmModel<B> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Convenience wrapper around [`Self::forward`].
     pub fn sample_next_latent(
         &self,
         sequence: Tensor<B, 3>,
@@ -223,6 +249,7 @@ impl<B: Backend + 'static> FlowLmModel<B> {
         )
     }
 
+    /// Combine text and latent sequences and run the transformer backbone.
     fn backbone(
         &self,
         input: Tensor<B, 3>,
@@ -248,9 +275,10 @@ impl<B: Backend + 'static> FlowLmModel<B> {
         output.narrow(1, total_len - sequence_len, sequence_len)
     }
 
+    /// Load weights from a Python-style state dict.
     pub fn load_state_dict(
         &mut self,
-        state: &HashMap<String, crate::weights::TensorData>,
+        state: &HashMap<String, WeightTensor>,
         device: &B::Device,
     ) -> anyhow::Result<()> {
         for (name, tensor) in state {
@@ -268,32 +296,32 @@ impl<B: Backend + 'static> FlowLmModel<B> {
             }
             if name == "conditioner.embed.weight" {
                 let weight = tensor2_from_data(tensor, device)?;
-                self.conditioner.embed.weight = burn::module::Param::from_tensor(weight);
+                self.conditioner.embed.weight = Param::from_tensor(weight);
                 continue;
             }
             if name == "input_linear.weight" {
                 let weight = tensor2_from_data(tensor, device)?;
-                self.input_linear.weight = burn::module::Param::from_tensor(weight.transpose());
+                self.input_linear.weight = Param::from_tensor(weight.transpose());
                 continue;
             }
             if name == "out_norm.weight" {
                 let weight = tensor1_from_data(tensor, device)?;
-                self.out_norm.gamma = burn::module::Param::from_tensor(weight);
+                self.out_norm.gamma = Param::from_tensor(weight);
                 continue;
             }
             if name == "out_norm.bias" {
                 let bias = tensor1_from_data(tensor, device)?;
-                self.out_norm.beta = Some(burn::module::Param::from_tensor(bias));
+                self.out_norm.beta = Some(Param::from_tensor(bias));
                 continue;
             }
             if name == "out_eos.weight" {
                 let weight = tensor2_from_data(tensor, device)?;
-                self.out_eos.weight = burn::module::Param::from_tensor(weight.transpose());
+                self.out_eos.weight = Param::from_tensor(weight.transpose());
                 continue;
             }
             if name == "out_eos.bias" {
                 let bias = tensor1_from_data(tensor, device)?;
-                self.out_eos.bias = Some(burn::module::Param::from_tensor(bias));
+                self.out_eos.bias = Some(Param::from_tensor(bias));
                 continue;
             }
 
@@ -312,7 +340,8 @@ impl<B: Backend + 'static> FlowLmModel<B> {
     }
 }
 
-fn tensor_f32(tensor: &crate::weights::TensorData) -> anyhow::Result<Vec<f32>> {
+/// Decode raw tensor bytes into f32 values for supported dtypes.
+fn tensor_f32(tensor: &WeightTensor) -> anyhow::Result<Vec<f32>> {
     match tensor.dtype {
         Dtype::F32 => {
             let mut values = Vec::with_capacity(tensor.data.len() / 4);
@@ -333,8 +362,9 @@ fn tensor_f32(tensor: &crate::weights::TensorData) -> anyhow::Result<Vec<f32>> {
     }
 }
 
+/// Convert a 1D tensor payload into a Burn tensor.
 fn tensor1_from_data<B: Backend>(
-    tensor: &crate::weights::TensorData,
+    tensor: &WeightTensor,
     device: &B::Device,
 ) -> anyhow::Result<Tensor<B, 1>> {
     let shape: [usize; 1] = tensor
@@ -349,8 +379,9 @@ fn tensor1_from_data<B: Backend>(
     ))
 }
 
+/// Convert a 2D tensor payload into a Burn tensor.
 fn tensor2_from_data<B: Backend>(
-    tensor: &crate::weights::TensorData,
+    tensor: &WeightTensor,
     device: &B::Device,
 ) -> anyhow::Result<Tensor<B, 2>> {
     let shape: [usize; 2] = tensor
@@ -365,10 +396,11 @@ fn tensor2_from_data<B: Backend>(
     ))
 }
 
+/// Apply weights targeting a streaming transformer layer.
 fn apply_transformer_weight<B: Backend>(
     transformer: &mut StreamingTransformer<B>,
     rest: &str,
-    tensor: &crate::weights::TensorData,
+    tensor: &WeightTensor,
     device: &B::Device,
 ) -> anyhow::Result<()> {
     let mut parts = rest.split('.');
@@ -384,65 +416,66 @@ fn apply_transformer_weight<B: Backend>(
     match tail.as_slice() {
         ["self_attn", "in_proj", "weight"] => {
             let weight = tensor2_from_data(tensor, device)?;
-            layer.qkv.weight = burn::module::Param::from_tensor(weight.transpose());
+            layer.qkv.weight = Param::from_tensor(weight.transpose());
         }
         ["self_attn", "out_proj", "weight"] => {
             let weight = tensor2_from_data(tensor, device)?;
-            layer.out_proj.weight = burn::module::Param::from_tensor(weight.transpose());
+            layer.out_proj.weight = Param::from_tensor(weight.transpose());
         }
         ["norm1", "weight"] => {
             let weight = tensor1_from_data(tensor, device)?;
-            layer.norm1.gamma = burn::module::Param::from_tensor(weight);
+            layer.norm1.gamma = Param::from_tensor(weight);
         }
         ["norm1", "bias"] => {
             let bias = tensor1_from_data(tensor, device)?;
-            layer.norm1.beta = Some(burn::module::Param::from_tensor(bias));
+            layer.norm1.beta = Some(Param::from_tensor(bias));
         }
         ["norm2", "weight"] => {
             let weight = tensor1_from_data(tensor, device)?;
-            layer.norm2.gamma = burn::module::Param::from_tensor(weight);
+            layer.norm2.gamma = Param::from_tensor(weight);
         }
         ["norm2", "bias"] => {
             let bias = tensor1_from_data(tensor, device)?;
-            layer.norm2.beta = Some(burn::module::Param::from_tensor(bias));
+            layer.norm2.beta = Some(Param::from_tensor(bias));
         }
         ["linear1", "weight"] => {
             let weight = tensor2_from_data(tensor, device)?;
-            layer.ffn_in.weight = burn::module::Param::from_tensor(weight.transpose());
+            layer.ffn_in.weight = Param::from_tensor(weight.transpose());
         }
         ["linear2", "weight"] => {
             let weight = tensor2_from_data(tensor, device)?;
-            layer.ffn_out.weight = burn::module::Param::from_tensor(weight.transpose());
+            layer.ffn_out.weight = Param::from_tensor(weight.transpose());
         }
         _ => {}
     }
     Ok(())
 }
 
+/// Apply weights targeting the flow network MLP.
 fn apply_flow_net_weight<B: Backend>(
     flow_net: &mut SimpleMlpAdaLn<B>,
     rest: &str,
-    tensor: &crate::weights::TensorData,
+    tensor: &WeightTensor,
     device: &B::Device,
 ) -> anyhow::Result<()> {
     if rest == "cond_embed.weight" {
         let weight = tensor2_from_data(tensor, device)?;
-        flow_net.cond_embed.weight = burn::module::Param::from_tensor(weight.transpose());
+        flow_net.cond_embed.weight = Param::from_tensor(weight.transpose());
         return Ok(());
     }
     if rest == "cond_embed.bias" {
         let bias = tensor1_from_data(tensor, device)?;
-        flow_net.cond_embed.bias = Some(burn::module::Param::from_tensor(bias));
+        flow_net.cond_embed.bias = Some(Param::from_tensor(bias));
         return Ok(());
     }
     if rest == "input_proj.weight" {
         let weight = tensor2_from_data(tensor, device)?;
-        flow_net.input_proj.weight = burn::module::Param::from_tensor(weight.transpose());
+        flow_net.input_proj.weight = Param::from_tensor(weight.transpose());
         return Ok(());
     }
     if rest == "input_proj.bias" {
         let bias = tensor1_from_data(tensor, device)?;
-        flow_net.input_proj.bias = Some(burn::module::Param::from_tensor(bias));
+        flow_net.input_proj.bias = Some(Param::from_tensor(bias));
         return Ok(());
     }
     if let Some(rest) = rest.strip_prefix("time_embed.") {
@@ -462,23 +495,23 @@ fn apply_flow_net_weight<B: Backend>(
             }
             ["mlp", "0", "weight"] => {
                 let weight = tensor2_from_data(tensor, device)?;
-                embedder.proj_in.weight = burn::module::Param::from_tensor(weight.transpose());
+                embedder.proj_in.weight = Param::from_tensor(weight.transpose());
             }
             ["mlp", "0", "bias"] => {
                 let bias = tensor1_from_data(tensor, device)?;
-                embedder.proj_in.bias = Some(burn::module::Param::from_tensor(bias));
+                embedder.proj_in.bias = Some(Param::from_tensor(bias));
             }
             ["mlp", "2", "weight"] => {
                 let weight = tensor2_from_data(tensor, device)?;
-                embedder.proj_out.weight = burn::module::Param::from_tensor(weight.transpose());
+                embedder.proj_out.weight = Param::from_tensor(weight.transpose());
             }
             ["mlp", "2", "bias"] => {
                 let bias = tensor1_from_data(tensor, device)?;
-                embedder.proj_out.bias = Some(burn::module::Param::from_tensor(bias));
+                embedder.proj_out.bias = Some(Param::from_tensor(bias));
             }
             ["mlp", "3", "alpha"] => {
                 let weight = tensor1_from_data(tensor, device)?;
-                embedder.norm.gamma = burn::module::Param::from_tensor(weight);
+                embedder.norm.gamma = Param::from_tensor(weight);
             }
             _ => {}
         }
@@ -498,35 +531,35 @@ fn apply_flow_net_weight<B: Backend>(
         match tail.as_slice() {
             ["in_ln", "weight"] => {
                 let weight = tensor1_from_data(tensor, device)?;
-                block.norm.gamma = burn::module::Param::from_tensor(weight);
+                block.norm.gamma = Param::from_tensor(weight);
             }
             ["in_ln", "bias"] => {
                 let bias = tensor1_from_data(tensor, device)?;
-                block.norm.beta = Some(burn::module::Param::from_tensor(bias));
+                block.norm.beta = Some(Param::from_tensor(bias));
             }
             ["mlp", "0", "weight"] => {
                 let weight = tensor2_from_data(tensor, device)?;
-                block.mlp_in.weight = burn::module::Param::from_tensor(weight.transpose());
+                block.mlp_in.weight = Param::from_tensor(weight.transpose());
             }
             ["mlp", "0", "bias"] => {
                 let bias = tensor1_from_data(tensor, device)?;
-                block.mlp_in.bias = Some(burn::module::Param::from_tensor(bias));
+                block.mlp_in.bias = Some(Param::from_tensor(bias));
             }
             ["mlp", "2", "weight"] => {
                 let weight = tensor2_from_data(tensor, device)?;
-                block.mlp_out.weight = burn::module::Param::from_tensor(weight.transpose());
+                block.mlp_out.weight = Param::from_tensor(weight.transpose());
             }
             ["mlp", "2", "bias"] => {
                 let bias = tensor1_from_data(tensor, device)?;
-                block.mlp_out.bias = Some(burn::module::Param::from_tensor(bias));
+                block.mlp_out.bias = Some(Param::from_tensor(bias));
             }
             ["adaLN_modulation", "1", "weight"] => {
                 let weight = tensor2_from_data(tensor, device)?;
-                block.mod_linear.weight = burn::module::Param::from_tensor(weight.transpose());
+                block.mod_linear.weight = Param::from_tensor(weight.transpose());
             }
             ["adaLN_modulation", "1", "bias"] => {
                 let bias = tensor1_from_data(tensor, device)?;
-                block.mod_linear.bias = Some(burn::module::Param::from_tensor(bias));
+                block.mod_linear.bias = Some(Param::from_tensor(bias));
             }
             _ => {}
         }
@@ -537,21 +570,19 @@ fn apply_flow_net_weight<B: Backend>(
         match tail.as_slice() {
             ["linear", "weight"] => {
                 let weight = tensor2_from_data(tensor, device)?;
-                flow_net.final_layer.linear.weight =
-                    burn::module::Param::from_tensor(weight.transpose());
+                flow_net.final_layer.linear.weight = Param::from_tensor(weight.transpose());
             }
             ["linear", "bias"] => {
                 let bias = tensor1_from_data(tensor, device)?;
-                flow_net.final_layer.linear.bias = Some(burn::module::Param::from_tensor(bias));
+                flow_net.final_layer.linear.bias = Some(Param::from_tensor(bias));
             }
             ["adaLN_modulation", "1", "weight"] => {
                 let weight = tensor2_from_data(tensor, device)?;
-                flow_net.final_layer.mod_linear.weight =
-                    burn::module::Param::from_tensor(weight.transpose());
+                flow_net.final_layer.mod_linear.weight = Param::from_tensor(weight.transpose());
             }
             ["adaLN_modulation", "1", "bias"] => {
                 let bias = tensor1_from_data(tensor, device)?;
-                flow_net.final_layer.mod_linear.bias = Some(burn::module::Param::from_tensor(bias));
+                flow_net.final_layer.mod_linear.bias = Some(Param::from_tensor(bias));
             }
             _ => {}
         }
@@ -559,6 +590,7 @@ fn apply_flow_net_weight<B: Backend>(
     Ok(())
 }
 
+/// Generate sampling noise with optional truncation.
 fn make_noise<B: Backend>(
     shape: [usize; 2],
     temp: f32,
@@ -575,6 +607,7 @@ fn make_noise<B: Backend>(
     Tensor::<B, 2>::random(shape, Distribution::Normal(0.0, std), device)
 }
 
+/// Draw from a normal distribution and reject out-of-bounds values.
 fn truncated_normal<B: Backend>(
     shape: [usize; 2],
     std: f64,
@@ -598,6 +631,7 @@ fn truncated_normal<B: Backend>(
     noise
 }
 
+/// Identify entries outside the clamp range.
 fn out_of_bounds<B: Backend>(noise: Tensor<B, 2>, clamp: f32) -> Tensor<B, 2, Bool> {
     noise
         .clone()

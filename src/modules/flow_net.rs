@@ -1,22 +1,35 @@
-use burn::module::Param;
-use burn::tensor::activation::silu;
-use burn::tensor::backend::Backend;
-use burn::tensor::{Tensor, TensorData};
+//! Flow network used by FlowLM to map noise to latent frames.
+//!
+//! This is a small MLP with adaptive layer normalization (AdaLN) conditioned on
+//! text and time embeddings, similar to diffusion-style parameterizations.
+
+use burn::{
+    module::Param,
+    tensor::{
+        activation::silu, backend::Backend, Tensor, TensorData as BurnTensorData,
+    },
+};
 use burn_nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig};
 
+/// Apply shift/scale modulation used by AdaLN.
 fn modulate<B: Backend>(x: Tensor<B, 2>, shift: Tensor<B, 2>, scale: Tensor<B, 2>) -> Tensor<B, 2> {
     let scale = scale.add_scalar(1.0);
     x.mul(scale).add(shift)
 }
 
+/// Configuration for timestep embeddings.
 #[derive(Debug, Clone)]
 pub struct TimestepEmbedderConfig {
+    /// Hidden size of the embedder.
     pub hidden_size: usize,
+    /// Size of the sinusoidal frequency embedding.
     pub frequency_embedding_size: usize,
+    /// Max period for log-spaced frequencies.
     pub max_period: f32,
 }
 
 impl TimestepEmbedderConfig {
+    /// Create a config with default frequency settings.
     pub fn new(hidden_size: usize) -> Self {
         Self {
             hidden_size,
@@ -26,25 +39,31 @@ impl TimestepEmbedderConfig {
     }
 }
 
+/// Configuration for RMS normalization.
 #[derive(Debug, Clone)]
 pub struct RmsNormConfig {
+    /// Feature dimension.
     pub dim: usize,
+    /// Numerical epsilon.
     pub epsilon: f32,
 }
 
 impl RmsNormConfig {
+    /// Create a new RMSNorm config with default epsilon.
     pub fn new(dim: usize) -> Self {
         Self { dim, epsilon: 1e-5 }
     }
 
+    /// Set a custom epsilon value.
     pub fn with_epsilon(mut self, epsilon: f32) -> Self {
         self.epsilon = epsilon;
         self
     }
 
+    /// Initialize an RMSNorm module on the given device.
     pub fn init<B: Backend>(&self, device: &B::Device) -> RmsNorm<B> {
         let values = vec![1.0_f32; self.dim];
-        let gamma = Tensor::<B, 1>::from_data(TensorData::new(values, [self.dim]), device);
+        let gamma = Tensor::<B, 1>::from_data(BurnTensorData::new(values, [self.dim]), device);
         RmsNorm {
             gamma: Param::from_tensor(gamma),
             epsilon: self.epsilon,
@@ -52,13 +71,17 @@ impl RmsNormConfig {
     }
 }
 
+/// RMS normalization with learnable scale.
 #[derive(Debug, Clone)]
 pub struct RmsNorm<B: Backend> {
+    /// Scale parameter.
     pub gamma: Param<Tensor<B, 1>>,
+    /// Numerical epsilon.
     pub epsilon: f32,
 }
 
 impl<B: Backend> RmsNorm<B> {
+    /// Apply RMS normalization across the feature dimension.
     pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
         let dim = x.dims()[1];
         let mean = x.clone().mean_dim(1);
@@ -74,15 +97,21 @@ impl<B: Backend> RmsNorm<B> {
     }
 }
 
+/// Sinusoidal timestep embedder with small MLP projection.
 #[derive(Debug, Clone)]
 pub struct TimestepEmbedder<B: Backend> {
+    /// Precomputed frequencies.
     pub freqs: Tensor<B, 1>,
+    /// Input projection.
     pub proj_in: Linear<B>,
+    /// Output projection.
     pub proj_out: Linear<B>,
+    /// RMS normalization.
     pub norm: RmsNorm<B>,
 }
 
 impl<B: Backend + 'static> TimestepEmbedder<B> {
+    /// Create a new embedder from config.
     pub fn new(config: TimestepEmbedderConfig, device: &B::Device) -> Self {
         let half = config.frequency_embedding_size / 2;
         let mut values = Vec::with_capacity(half);
@@ -90,7 +119,7 @@ impl<B: Backend + 'static> TimestepEmbedder<B> {
             let exponent = -config.max_period.ln() * (i as f32) / (half as f32);
             values.push(exponent.exp());
         }
-        let freqs = Tensor::<B, 1>::from_data(TensorData::new(values, [half]), device);
+        let freqs = Tensor::<B, 1>::from_data(BurnTensorData::new(values, [half]), device);
 
         let proj_in = LinearConfig::new(config.frequency_embedding_size, config.hidden_size)
             .init::<B>(device);
@@ -104,6 +133,7 @@ impl<B: Backend + 'static> TimestepEmbedder<B> {
         }
     }
 
+    /// Embed a batch of timestep scalars.
     pub fn forward(&self, t: Tensor<B, 2>) -> Tensor<B, 2> {
         let freqs = self.freqs.clone().unsqueeze_dim::<2>(0);
         let args = t.mul(freqs);
@@ -115,17 +145,21 @@ impl<B: Backend + 'static> TimestepEmbedder<B> {
     }
 }
 
+/// Configuration for a residual MLP block.
 #[derive(Debug, Clone)]
 pub struct ResBlockConfig {
+    /// Feature size.
     pub channels: usize,
 }
 
 impl ResBlockConfig {
+    /// Create a config for a given channel size.
     pub fn new(channels: usize) -> Self {
         Self { channels }
     }
 }
 
+/// Residual MLP block with AdaLN-style modulation.
 #[derive(Debug, Clone)]
 pub struct ResBlock<B: Backend> {
     pub channels: usize,
@@ -136,6 +170,7 @@ pub struct ResBlock<B: Backend> {
 }
 
 impl<B: Backend + 'static> ResBlock<B> {
+    /// Construct a residual block from config.
     pub fn new(config: ResBlockConfig, device: &B::Device) -> Self {
         let norm = LayerNormConfig::new(config.channels)
             .with_epsilon(1e-6)
@@ -152,6 +187,7 @@ impl<B: Backend + 'static> ResBlock<B> {
         }
     }
 
+    /// Forward pass with conditioning signal `y`.
     pub fn forward(&self, x: Tensor<B, 2>, y: Tensor<B, 2>) -> Tensor<B, 2> {
         let modulation = self.mod_linear.forward(silu(y));
         let shift = modulation.clone().narrow(1, 0, self.channels);
@@ -166,13 +202,17 @@ impl<B: Backend + 'static> ResBlock<B> {
     }
 }
 
+/// Configuration for the final AdaLN layer.
 #[derive(Debug, Clone)]
 pub struct FinalLayerConfig {
+    /// Hidden size.
     pub model_channels: usize,
+    /// Output size.
     pub out_channels: usize,
 }
 
 impl FinalLayerConfig {
+    /// Create a config from sizes.
     pub fn new(model_channels: usize, out_channels: usize) -> Self {
         Self {
             model_channels,
@@ -181,6 +221,7 @@ impl FinalLayerConfig {
     }
 }
 
+/// Final projection layer for the flow network.
 #[derive(Debug, Clone)]
 pub struct FinalLayer<B: Backend> {
     pub model_channels: usize,
@@ -190,6 +231,7 @@ pub struct FinalLayer<B: Backend> {
 }
 
 impl<B: Backend + 'static> FinalLayer<B> {
+    /// Construct the final layer from config.
     pub fn new(config: FinalLayerConfig, device: &B::Device) -> Self {
         let norm = LayerNormConfig::new(config.model_channels)
             .with_epsilon(1e-6)
@@ -207,6 +249,7 @@ impl<B: Backend + 'static> FinalLayer<B> {
         }
     }
 
+    /// Forward pass with conditioning signal `y`.
     pub fn forward(&self, x: Tensor<B, 2>, y: Tensor<B, 2>) -> Tensor<B, 2> {
         let modulation = self.mod_linear.forward(silu(y));
         let shift = modulation.clone().narrow(1, 0, self.model_channels);
@@ -216,18 +259,27 @@ impl<B: Backend + 'static> FinalLayer<B> {
     }
 }
 
+/// Configuration for the full SimpleMlpAdaLn network.
 #[derive(Debug, Clone)]
 pub struct SimpleMlpAdaLnConfig {
+    /// Input latent dimension.
     pub in_channels: usize,
+    /// Hidden model dimension.
     pub model_channels: usize,
+    /// Output latent dimension.
     pub out_channels: usize,
+    /// Conditioning dimension.
     pub cond_channels: usize,
+    /// Number of residual blocks.
     pub num_res_blocks: usize,
+    /// Number of time condition inputs.
     pub num_time_conds: usize,
+    /// Timestep embedding configuration.
     pub time_embed: TimestepEmbedderConfig,
 }
 
 impl SimpleMlpAdaLnConfig {
+    /// Create a config with default depth and time settings.
     pub fn new(
         in_channels: usize,
         model_channels: usize,
@@ -246,6 +298,7 @@ impl SimpleMlpAdaLnConfig {
     }
 }
 
+/// Small MLP used as the flow network inside FlowLM.
 #[derive(Debug, Clone)]
 pub struct SimpleMlpAdaLn<B: Backend> {
     pub num_time_conds: usize,
@@ -257,6 +310,7 @@ pub struct SimpleMlpAdaLn<B: Backend> {
 }
 
 impl<B: Backend + 'static> SimpleMlpAdaLn<B> {
+    /// Construct the flow network from config.
     pub fn new(config: SimpleMlpAdaLnConfig, device: &B::Device) -> Self {
         assert!(config.num_time_conds != 1, "num_time_conds must not be 1");
         let mut time_embed = Vec::with_capacity(config.num_time_conds);
@@ -292,6 +346,7 @@ impl<B: Backend + 'static> SimpleMlpAdaLn<B> {
         }
     }
 
+    /// Forward pass for the flow network.
     pub fn forward(
         &self,
         c: Tensor<B, 2>,
@@ -326,6 +381,7 @@ impl<B: Backend + 'static> SimpleMlpAdaLn<B> {
     }
 }
 
+/// Langevin-style decode loop for flow matching.
 pub fn lsd_decode<B: Backend, F>(v_t: F, x_0: Tensor<B, 2>, num_steps: usize) -> Tensor<B, 2>
 where
     F: Fn(Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>) -> Tensor<B, 2>,
@@ -347,8 +403,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::module::Param;
-    use burn::tensor::{TensorData, Tolerance};
+    use burn::{module::Param, tensor::{TensorData as BurnTensorData, Tolerance}};
     use burn_ndarray::{NdArray, NdArrayDevice};
     use serde::Deserialize;
     use std::fs;
@@ -356,18 +411,21 @@ mod tests {
 
     type TestBackend = NdArray<f32>;
 
+    /// Linear layer weights from a fixture file.
     #[derive(Debug, Deserialize)]
     struct LinearWeights {
         weight: Vec<Vec<f32>>,
         bias: Vec<f32>,
     }
 
+    /// LayerNorm weights from a fixture file.
     #[derive(Debug, Deserialize)]
     struct NormWeights {
         weight: Vec<f32>,
         bias: Option<Vec<f32>>,
     }
 
+    /// Timestep embedder weights from a fixture file.
     #[derive(Debug, Deserialize)]
     struct TimeEmbedWeights {
         proj_in: LinearWeights,
@@ -375,6 +433,7 @@ mod tests {
         rms_weight: Vec<f32>,
     }
 
+    /// Residual block weights from a fixture file.
     #[derive(Debug, Deserialize)]
     struct ResBlockWeights {
         norm: NormWeights,
@@ -383,6 +442,7 @@ mod tests {
         modulation: LinearWeights,
     }
 
+    /// Final layer weights from a fixture file.
     #[derive(Debug, Deserialize)]
     struct FinalLayerWeights {
         norm: NormWeights,
@@ -390,6 +450,7 @@ mod tests {
         modulation: LinearWeights,
     }
 
+    /// Full flow net weights for a fixture.
     #[derive(Debug, Deserialize)]
     struct FlowNetWeights {
         input_proj: LinearWeights,
@@ -399,6 +460,7 @@ mod tests {
         final_layer: FinalLayerWeights,
     }
 
+    /// Input tensors for a flow net fixture.
     #[derive(Debug, Deserialize)]
     struct FlowNetInputs {
         c: Vec<Vec<f32>>,
@@ -408,12 +470,14 @@ mod tests {
         noise: Vec<Vec<f32>>,
     }
 
+    /// Expected outputs for a flow net fixture.
     #[derive(Debug, Deserialize)]
     struct FlowNetExpected {
         flow_out: Vec<Vec<f32>>,
         lsd_out: Vec<Vec<f32>>,
     }
 
+    /// Config values stored in a fixture file.
     #[derive(Debug, Deserialize)]
     struct FlowNetConfigData {
         in_channels: usize,
@@ -426,6 +490,7 @@ mod tests {
         max_period: f32,
     }
 
+    /// Full flow net test fixture (config, weights, inputs, outputs).
     #[derive(Debug, Deserialize)]
     struct FlowNetFixture {
         config: FlowNetConfigData,
@@ -434,6 +499,7 @@ mod tests {
         expected: FlowNetExpected,
     }
 
+    /// RMSNorm fixture data for regression tests.
     #[derive(Debug, Deserialize)]
     struct RmsNormFixture {
         eps: f32,
@@ -442,6 +508,7 @@ mod tests {
         output: Vec<Vec<f32>>,
     }
 
+    /// Resolve the flow net fixture file path.
     fn fixture_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -449,11 +516,13 @@ mod tests {
             .join("flow_net.json")
     }
 
+    /// Load the flow net fixture JSON.
     fn load_fixture() -> FlowNetFixture {
         let data = fs::read_to_string(fixture_path()).expect("fixture missing");
         serde_json::from_str(&data).expect("fixture parse")
     }
 
+    /// Load the RMSNorm fixture JSON.
     fn load_rmsnorm_fixture() -> RmsNormFixture {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -463,14 +532,16 @@ mod tests {
         serde_json::from_str(&data).expect("rmsnorm fixture parse")
     }
 
+    /// Build a 2D tensor from nested vectors.
     fn tensor2(device: &NdArrayDevice, data: Vec<Vec<f32>>) -> Tensor<TestBackend, 2> {
         let rows = data.len();
         let cols = data.first().map(|row| row.len()).unwrap_or(0);
         let flat: Vec<f32> = data.into_iter().flatten().collect();
-        let tensor_data = TensorData::new(flat, [rows, cols]);
+        let tensor_data = BurnTensorData::new(flat, [rows, cols]);
         Tensor::from_data(tensor_data, device)
     }
 
+    /// Assign fixture weights to a linear layer.
     fn apply_linear(
         linear: &mut Linear<TestBackend>,
         weights: &LinearWeights,
@@ -479,33 +550,35 @@ mod tests {
         let rows = weights.weight.len();
         let cols = weights.weight.first().map(|row| row.len()).unwrap_or(0);
         let flat: Vec<f32> = weights.weight.clone().into_iter().flatten().collect();
-        let weight = Tensor::from_data(TensorData::new(flat, [rows, cols]), device);
+        let weight = Tensor::from_data(BurnTensorData::new(flat, [rows, cols]), device);
         linear.weight = Param::from_tensor(weight);
         let bias = Tensor::from_data(
-            TensorData::new(weights.bias.clone(), [weights.bias.len()]),
+            BurnTensorData::new(weights.bias.clone(), [weights.bias.len()]),
             device,
         );
         linear.bias = Some(Param::from_tensor(bias));
     }
 
+    /// Assign fixture weights to a layer norm.
     fn apply_norm(
         norm: &mut LayerNorm<TestBackend>,
         weights: &NormWeights,
         device: &NdArrayDevice,
     ) {
         let gamma = Tensor::from_data(
-            TensorData::new(weights.weight.clone(), [weights.weight.len()]),
+            BurnTensorData::new(weights.weight.clone(), [weights.weight.len()]),
             device,
         );
         norm.gamma = Param::from_tensor(gamma);
         norm.beta = weights.bias.as_ref().map(|bias| {
-            let beta = Tensor::from_data(TensorData::new(bias.clone(), [bias.len()]), device);
+            let beta = Tensor::from_data(BurnTensorData::new(bias.clone(), [bias.len()]), device);
             Param::from_tensor(beta)
         });
     }
 
+    /// Assign fixture weights to an RMSNorm.
     fn apply_rms(norm: &mut RmsNorm<TestBackend>, weights: &[f32], device: &NdArrayDevice) {
-        let gamma = Tensor::from_data(TensorData::new(weights.to_vec(), [weights.len()]), device);
+        let gamma = Tensor::from_data(BurnTensorData::new(weights.to_vec(), [weights.len()]), device);
         norm.gamma = Param::from_tensor(gamma);
     }
 
@@ -657,7 +730,7 @@ mod tests {
             .init::<TestBackend>(&device);
 
         let gamma = Tensor::from_data(
-            TensorData::new(fixture.gamma.clone(), [fixture.gamma.len()]),
+            BurnTensorData::new(fixture.gamma.clone(), [fixture.gamma.len()]),
             &device,
         );
         norm.gamma = Param::from_tensor(gamma);

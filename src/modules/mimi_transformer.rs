@@ -1,49 +1,75 @@
+//! Transformer blocks used inside the Mimi codec.
+//!
+//! Mimi uses a small transformer to model temporal relationships in the latent
+//! frame sequence. This module implements those layers with streaming support.
+
 use crate::modules::layer_scale::{LayerScale, LayerScaleConfig};
 use crate::modules::linear::{
     apply_layer_norm_3d as apply_layer_norm, apply_linear_3d as apply_linear, merge_heads,
     split_qkv,
 };
-use burn::tensor::activation::gelu;
-use burn::tensor::backend::Backend;
-use burn::tensor::module::attention;
-use burn::tensor::{Bool, Int, Tensor};
+use burn::tensor::{activation::gelu, backend::Backend, module::attention, Bool, Int, Tensor};
 use burn_nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig};
 
+/// Configuration for the Mimi transformer stack.
 #[derive(Debug, Clone)]
 pub struct MimiTransformerConfig {
+    /// Model width.
     pub d_model: usize,
+    /// Number of attention heads.
     pub num_heads: usize,
+    /// Number of transformer layers.
     pub num_layers: usize,
+    /// LayerScale init value.
     pub layer_scale: f32,
+    /// Attention context window.
     pub context: usize,
+    /// RoPE max period.
     pub max_period: f32,
+    /// Feed-forward hidden size.
     pub dim_feedforward: usize,
 }
 
+/// Configuration for a projected Mimi transformer (input/output projections).
 #[derive(Debug, Clone)]
 pub struct MimiProjectedTransformerConfig {
+    /// Input dimension before projection.
     pub input_dim: usize,
+    /// Output projection dimensions.
     pub output_dims: Vec<usize>,
+    /// Core transformer config.
     pub transformer: MimiTransformerConfig,
 }
 
+/// Self-attention module with RoPE and context window.
 #[derive(Debug, Clone)]
 pub struct MimiSelfAttention<B: Backend> {
+    /// Combined QKV projection.
     pub in_proj: Linear<B>,
+    /// Output projection.
     pub out_proj: Linear<B>,
+    /// Number of heads.
     pub num_heads: usize,
+    /// Head dimension.
     pub head_dim: usize,
+    /// Context window length.
     pub context: usize,
+    /// RoPE max period.
     pub max_period: f32,
 }
 
+/// Streaming state for Mimi self-attention.
 #[derive(Debug, Clone)]
 pub struct MimiSelfAttentionState<B: Backend> {
+    /// Current offset for RoPE positions.
     pub offset: Tensor<B, 1, Int>,
+    /// Cached keys.
     pub keys: Option<Tensor<B, 4>>,
+    /// Cached values.
     pub values: Option<Tensor<B, 4>>,
 }
 
+/// Single transformer layer used by Mimi.
 #[derive(Debug, Clone)]
 pub struct MimiTransformerLayer<B: Backend> {
     pub self_attn: MimiSelfAttention<B>,
@@ -55,27 +81,34 @@ pub struct MimiTransformerLayer<B: Backend> {
     pub layer_scale_2: Option<LayerScale<B>>,
 }
 
+/// Streaming state for a Mimi transformer layer.
 #[derive(Debug, Clone)]
 pub struct MimiTransformerLayerState<B: Backend> {
     pub self_attn: MimiSelfAttentionState<B>,
 }
 
+/// Streaming state for a full Mimi transformer stack.
 #[derive(Debug, Clone)]
 pub struct MimiTransformerState<B: Backend> {
     pub layers: Vec<MimiTransformerLayerState<B>>,
 }
 
+/// Transformer stack for Mimi latent sequences.
 #[derive(Debug, Clone)]
 pub struct MimiTransformer<B: Backend> {
     pub layers: Vec<MimiTransformerLayer<B>>,
 }
 
+/// Output projection selection for projected transformers.
 #[derive(Debug, Clone)]
 pub enum ProjectedOutput<B: Backend> {
+    /// Pass-through output (no projection).
     Identity,
+    /// Linear projection to a different dimension.
     Linear(Linear<B>),
 }
 
+/// Transformer with optional input and multiple output projections.
 #[derive(Debug, Clone)]
 pub struct MimiProjectedTransformer<B: Backend> {
     pub input_proj: Option<Linear<B>>,
@@ -83,6 +116,7 @@ pub struct MimiProjectedTransformer<B: Backend> {
     pub transformer: MimiTransformer<B>,
 }
 
+/// Compute absolute positions from an offset vector.
 fn positions_from_offset<B: Backend>(
     offset: Tensor<B, 1, Int>,
     length: usize,
@@ -95,6 +129,7 @@ fn positions_from_offset<B: Backend>(
     positions.add(offset)
 }
 
+/// Apply rotary position embeddings to query/key tensors.
 fn apply_rope<B: Backend>(
     q: Tensor<B, 4>,
     k: Tensor<B, 4>,
@@ -158,6 +193,7 @@ fn apply_rope<B: Backend>(
 }
 
 impl<B: Backend + 'static> MimiSelfAttention<B> {
+    /// Initialize a fresh streaming attention state.
     fn init_state(&self, batch_size: usize, device: &B::Device) -> MimiSelfAttentionState<B> {
         MimiSelfAttentionState {
             offset: Tensor::<B, 1, Int>::zeros([batch_size], device),
@@ -166,10 +202,12 @@ impl<B: Backend + 'static> MimiSelfAttention<B> {
         }
     }
 
+    /// Advance the internal offset by `increment`.
     fn increment_step(&self, state: &mut MimiSelfAttentionState<B>, increment: usize) {
         state.offset = state.offset.clone().add_scalar(increment as i64);
     }
 
+    /// Run attention over an input chunk and update the cache.
     fn forward(&self, input: Tensor<B, 3>, state: &mut MimiSelfAttentionState<B>) -> Tensor<B, 3> {
         let projected = apply_linear(&self.in_proj, input);
 
@@ -240,6 +278,7 @@ impl<B: Backend + 'static> MimiSelfAttention<B> {
 }
 
 impl<B: Backend + 'static> MimiTransformerLayer<B> {
+    /// Construct a transformer layer from config.
     pub fn new(config: &MimiTransformerConfig, device: &B::Device) -> Self {
         let head_dim = config.d_model / config.num_heads;
         assert!(head_dim.is_multiple_of(2), "RoPE head_dim must be even");
@@ -289,6 +328,7 @@ impl<B: Backend + 'static> MimiTransformerLayer<B> {
         }
     }
 
+    /// Initialize streaming state for this layer.
     pub fn init_state(
         &self,
         batch_size: usize,
@@ -299,11 +339,13 @@ impl<B: Backend + 'static> MimiTransformerLayer<B> {
         }
     }
 
+    /// Increment the attention position by `increment`.
     pub fn increment_step(&self, state: &mut MimiTransformerLayerState<B>, increment: usize) {
         self.self_attn
             .increment_step(&mut state.self_attn, increment);
     }
 
+    /// Forward pass for a single transformer layer.
     pub fn forward(
         &self,
         input: Tensor<B, 3>,
@@ -332,6 +374,7 @@ impl<B: Backend + 'static> MimiTransformerLayer<B> {
 }
 
 impl<B: Backend + 'static> MimiTransformer<B> {
+    /// Construct a transformer stack from config.
     pub fn new(config: MimiTransformerConfig, device: &B::Device) -> Self {
         let mut layers = Vec::with_capacity(config.num_layers);
         for _ in 0..config.num_layers {
@@ -340,6 +383,7 @@ impl<B: Backend + 'static> MimiTransformer<B> {
         Self { layers }
     }
 
+    /// Initialize streaming state for all layers.
     pub fn init_state(&self, batch_size: usize, device: &B::Device) -> MimiTransformerState<B> {
         let layers = self
             .layers
@@ -349,12 +393,14 @@ impl<B: Backend + 'static> MimiTransformer<B> {
         MimiTransformerState { layers }
     }
 
+    /// Increment all layer positions.
     pub fn increment_step(&self, state: &mut MimiTransformerState<B>, increment: usize) {
         for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
             layer.increment_step(layer_state, increment);
         }
     }
 
+    /// Forward pass through the transformer stack.
     pub fn forward(
         &self,
         mut input: Tensor<B, 3>,
@@ -368,6 +414,7 @@ impl<B: Backend + 'static> MimiTransformer<B> {
 }
 
 impl<B: Backend + 'static> MimiProjectedTransformer<B> {
+    /// Construct a projected transformer from config.
     pub fn new(config: MimiProjectedTransformerConfig, device: &B::Device) -> Self {
         let transformer = MimiTransformer::new(config.transformer.clone(), device);
         let input_proj = if config.input_dim == config.transformer.d_model {
@@ -399,14 +446,17 @@ impl<B: Backend + 'static> MimiProjectedTransformer<B> {
         }
     }
 
+    /// Initialize transformer state for streaming.
     pub fn init_state(&self, batch_size: usize, device: &B::Device) -> MimiTransformerState<B> {
         self.transformer.init_state(batch_size, device)
     }
 
+    /// Increment the transformer position by `increment`.
     pub fn increment_step(&self, state: &mut MimiTransformerState<B>, increment: usize) {
         self.transformer.increment_step(state, increment);
     }
 
+    /// Forward pass with input/output projections.
     pub fn forward(
         &self,
         input: Tensor<B, 3>,

@@ -1,24 +1,34 @@
-use crate::state::{StreamStep, StreamingModule};
-use burn::tensor::activation::softmax;
-use burn::tensor::backend::Backend;
-use burn::tensor::{Bool, Int, Tensor};
+//! Streaming multi-head attention with RoPE support.
+//!
+//! This module caches key/value tensors so attention can be computed over
+//! incremental chunks while preserving causality and optional context windows.
+
+use crate::state::StreamingModule;
+use burn::tensor::{activation::softmax, backend::Backend, Bool, Int, Tensor};
 use std::marker::PhantomData;
 
+/// Marker type used to implement the [`StreamingModule`] trait.
 #[derive(Debug, Default)]
 pub struct StreamingMha;
 
+/// Streaming attention state (cache + position).
 #[derive(Debug, Clone)]
 pub struct StreamingMhaState<B: Backend> {
-    pub step: StreamStep,
+    /// Current streaming step.
+    pub step: usize,
+    /// Number of cached key/value positions.
     pub cached_tokens: usize,
+    /// Cached keys `[batch, heads, seq, dim]`.
     pub keys: Option<Tensor<B, 4>>,
+    /// Cached values `[batch, heads, seq, dim]`.
     pub values: Option<Tensor<B, 4>>,
 }
 
 impl<B: Backend> Default for StreamingMhaState<B> {
+    /// Create an empty attention cache with step counter at zero.
     fn default() -> Self {
         Self {
-            step: StreamStep::new(),
+            step: 0,
             cached_tokens: 0,
             keys: None,
             values: None,
@@ -26,18 +36,27 @@ impl<B: Backend> Default for StreamingMhaState<B> {
     }
 }
 
+/// Configuration for streaming attention.
 #[derive(Debug, Clone)]
 pub struct StreamingMhaConfig {
+    /// Maximum number of cached tokens (0 = unlimited).
     pub max_cache_tokens: usize,
+    /// Number of attention heads.
     pub num_heads: usize,
+    /// Head dimension.
     pub head_dim: usize,
+    /// Optional sliding context window.
     pub context: Option<usize>,
+    /// Enforce causal masking.
     pub causal: bool,
+    /// Optional RoPE max sequence length clamp.
     pub rope_max_seq: Option<usize>,
+    /// RoPE base period.
     pub rope_theta: f32,
 }
 
 impl Default for StreamingMhaConfig {
+    /// Default to a minimal 1-head, causal attention config.
     fn default() -> Self {
         Self {
             max_cache_tokens: 0,
@@ -51,13 +70,16 @@ impl Default for StreamingMhaConfig {
     }
 }
 
+/// Streaming attention operator that owns configuration only.
 #[derive(Debug, Clone)]
 pub struct StreamingMhaOp<B: Backend> {
+    /// Attention configuration.
     pub config: StreamingMhaConfig,
     _backend: PhantomData<B>,
 }
 
 impl<B: Backend> StreamingMhaOp<B> {
+    /// Create a new streaming attention op.
     pub fn new(config: StreamingMhaConfig, device: &B::Device) -> Self {
         let _ = device;
         Self {
@@ -66,6 +88,7 @@ impl<B: Backend> StreamingMhaOp<B> {
         }
     }
 
+    /// Append key/value tensors to the cache and update the step counter.
     pub fn append_kv(
         &self,
         state: &mut StreamingMhaState<B>,
@@ -92,17 +115,31 @@ impl<B: Backend> StreamingMhaOp<B> {
         }
 
         state.cached_tokens = keys.dims()[2];
-        state.step.increment(added);
+        state.step = state.step.saturating_add(added);
         state.keys = Some(keys);
         state.values = Some(values);
     }
 
+    /// Apply rotary position embeddings (RoPE) to a tensor chunk.
     pub fn apply_rope(&self, tensor: Tensor<B, 4>, start: usize) -> Tensor<B, 4> {
         let [batch, heads, seq, dim] = tensor.dims();
-        let half = dim / 2;
-        let device = tensor.device();
+        if dim < 2 {
+            return tensor;
+        }
+        let rot_dim = dim - (dim % 2);
+        let (rot, tail) = if rot_dim == dim {
+            (tensor, None)
+        } else {
+            (
+                tensor.clone().narrow(3, 0, rot_dim),
+                Some(tensor.narrow(3, rot_dim, dim - rot_dim)),
+            )
+        };
 
-        let scale = -self.config.rope_theta.ln() * 2.0 / dim as f32;
+        let half = rot_dim / 2;
+        let device = rot.device();
+
+        let scale = -self.config.rope_theta.ln() * 2.0 / rot_dim as f32;
         let ds = Tensor::<B, 1, Int>::arange(0..half as i64, &device).float();
         let freqs = ds.mul_scalar(scale).exp();
 
@@ -128,7 +165,7 @@ impl<B: Backend> StreamingMhaOp<B> {
             .repeat_dim(0, batch)
             .repeat_dim(2, heads);
 
-        let reshaped = tensor.swap_dims(1, 2).reshape([batch, seq, heads, half, 2]);
+        let reshaped = rot.swap_dims(1, 2).reshape([batch, seq, heads, half, 2]);
         let real = reshaped
             .clone()
             .narrow(4, 0, 1)
@@ -144,17 +181,23 @@ impl<B: Backend> StreamingMhaOp<B> {
             .sub(imag.clone().mul(roti.clone()));
         let rot_imag = real.mul(roti).add(imag.mul(rotr));
 
-        Tensor::cat(
+        let rotated = Tensor::cat(
             vec![
                 rot_real.unsqueeze_dim::<5>(4),
                 rot_imag.unsqueeze_dim::<5>(4),
             ],
             4,
         )
-        .reshape([batch, seq, heads, dim])
-        .swap_dims(1, 2)
+        .reshape([batch, seq, heads, rot_dim])
+        .swap_dims(1, 2);
+
+        match tail {
+            Some(tail) => Tensor::cat(vec![rotated, tail], 3),
+            None => rotated,
+        }
     }
 
+    /// Compute attention over cached keys/values for the given queries.
     pub fn attention(&self, state: &StreamingMhaState<B>, queries: Tensor<B, 4>) -> Tensor<B, 4> {
         let keys = state.keys.clone().expect("keys must be set");
         let values = state.values.clone().expect("values must be set");
@@ -163,8 +206,8 @@ impl<B: Backend> StreamingMhaOp<B> {
         let q_len = queries.dims()[2];
         let k_len = keys.dims()[2];
 
-        let q_start = state.step.index.saturating_sub(q_len);
-        let k_start = state.step.index.saturating_sub(state.cached_tokens);
+        let q_start = state.step.saturating_sub(q_len);
+        let k_start = state.step.saturating_sub(state.cached_tokens);
         let mask = self.build_mask(
             batch,
             heads,
@@ -190,6 +233,7 @@ impl<B: Backend> StreamingMhaOp<B> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Build a causal/context mask for attention.
     fn build_mask(
         &self,
         batch: usize,
@@ -229,19 +273,21 @@ impl<B: Backend> StreamingMhaOp<B> {
 impl<B: Backend> StreamingModule<B> for StreamingMha {
     type State = StreamingMhaState<B>;
 
+    /// Initialize an empty attention cache.
     fn init_state(&self, _batch_size: usize, _sequence_length: usize) -> Self::State {
         StreamingMhaState::default()
     }
 
+    /// Increment the internal step counter.
     fn increment_step(&self, state: &mut Self::State, increment: usize) {
-        state.step.increment(increment);
+        state.step = state.step.saturating_add(increment);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::tensor::TensorData;
+    use burn::tensor::TensorData as BurnTensorData;
     use burn_ndarray::{NdArray, NdArrayDevice};
 
     type TestBackend = NdArray<f32>;
@@ -297,6 +343,6 @@ mod tests {
         let op = StreamingMhaOp::<TestBackend>::new(config, &device);
         let input = Tensor::<TestBackend, 4>::from_floats([[[[1.0, 0.0, 0.0, 1.0]]]], &device);
         let output = op.apply_rope(input, 1).to_data();
-        assert_ne!(output, TensorData::from([[[[1.0, 0.0, 0.0, 1.0]]]]));
+        assert_ne!(output, BurnTensorData::from([[[[1.0, 0.0, 0.0, 1.0]]]]));
     }
 }

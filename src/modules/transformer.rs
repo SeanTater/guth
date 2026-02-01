@@ -1,27 +1,40 @@
+//! Streaming transformer blocks used by FlowLM.
+//!
+//! These layers are designed to support incremental generation by keeping KV
+//! caches and step counters in state.
+
 use crate::modules::layer_scale::{LayerScale, LayerScaleConfig};
 use crate::modules::linear::{apply_layer_norm_3d, apply_linear_3d, merge_heads, split_qkv};
 use crate::modules::streaming_mha::{
     StreamingMha, StreamingMhaConfig, StreamingMhaOp, StreamingMhaState,
 };
 use crate::state::StreamingModule;
-use burn::tensor::activation::gelu;
-use burn::tensor::backend::Backend;
-use burn::tensor::Tensor;
+use burn::tensor::{activation::gelu, backend::Backend, Tensor};
 use burn_nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig};
 
+/// Configuration for a single streaming transformer layer.
 #[derive(Debug, Clone)]
 pub struct StreamingTransformerLayerConfig {
+    /// Model width.
     pub d_model: usize,
+    /// Number of attention heads.
     pub num_heads: usize,
+    /// Feed-forward hidden size.
     pub ffn_dim: usize,
+    /// Enforce causal masking.
     pub causal: bool,
+    /// Optional context window length.
     pub context: Option<usize>,
+    /// Optional RoPE max sequence length clamp.
     pub rope_max_seq: Option<usize>,
+    /// RoPE base period.
     pub rope_theta: f32,
+    /// Optional LayerScale init value.
     pub layer_scale: Option<f32>,
 }
 
 impl Default for StreamingTransformerLayerConfig {
+    /// Reasonable defaults for a small causal transformer layer.
     fn default() -> Self {
         Self {
             d_model: 512,
@@ -36,6 +49,7 @@ impl Default for StreamingTransformerLayerConfig {
     }
 }
 
+/// Streaming transformer layer with attention + MLP.
 #[derive(Debug, Clone)]
 pub struct StreamingTransformerLayer<B: Backend> {
     pub num_heads: usize,
@@ -51,12 +65,14 @@ pub struct StreamingTransformerLayer<B: Backend> {
     pub mha: StreamingMhaOp<B>,
 }
 
+/// Streaming state for a transformer layer.
 #[derive(Debug, Clone)]
 pub struct StreamingTransformerLayerState<B: Backend> {
     pub mha: StreamingMhaState<B>,
 }
 
 impl<B: Backend + 'static> StreamingTransformerLayer<B> {
+    /// Construct a layer from config.
     pub fn new(config: StreamingTransformerLayerConfig, device: &B::Device) -> Self {
         let head_dim = config.d_model / config.num_heads;
         let qkv = LinearConfig::new(config.d_model, config.d_model * 3)
@@ -107,6 +123,7 @@ impl<B: Backend + 'static> StreamingTransformerLayer<B> {
         }
     }
 
+    /// Forward pass for a single layer.
     pub fn forward(
         &self,
         input: Tensor<B, 3>,
@@ -117,7 +134,7 @@ impl<B: Backend + 'static> StreamingTransformerLayer<B> {
         let qkv = self.apply_linear(&self.qkv, normalized);
         let (queries, keys, values) = split_qkv(qkv, self.num_heads, self.head_dim);
 
-        let start = state.mha.step.index;
+        let start = state.mha.step;
         let queries = self.mha.apply_rope(queries, start);
         let keys = self.mha.apply_rope(keys, start);
 
@@ -143,6 +160,7 @@ impl<B: Backend + 'static> StreamingTransformerLayer<B> {
         hidden.add(ffn)
     }
 
+    /// Apply a linear op to a 3D tensor with zero-length handling.
     fn apply_linear(&self, linear: &Linear<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
         apply_linear_3d(linear, input)
     }
@@ -151,34 +169,42 @@ impl<B: Backend + 'static> StreamingTransformerLayer<B> {
 impl<B: Backend + 'static> StreamingModule<B> for StreamingTransformerLayer<B> {
     type State = StreamingTransformerLayerState<B>;
 
+    /// Initialize streaming state for the layer.
     fn init_state(&self, _batch_size: usize, _sequence_length: usize) -> Self::State {
         StreamingTransformerLayerState {
             mha: StreamingMha.init_state(0, 0),
         }
     }
 
+    /// Increment the attention step counter.
     fn increment_step(&self, state: &mut Self::State, increment: usize) {
-        state.mha.step.increment(increment);
+        state.mha.step = state.mha.step.saturating_add(increment);
     }
 }
 
+/// Configuration for a stack of streaming transformer layers.
 #[derive(Debug, Clone)]
 pub struct StreamingTransformerConfig {
+    /// Number of layers.
     pub num_layers: usize,
+    /// Shared layer configuration.
     pub layer: StreamingTransformerLayerConfig,
 }
 
+/// Transformer stack for streaming inference.
 #[derive(Debug, Clone)]
 pub struct StreamingTransformer<B: Backend> {
     pub layers: Vec<StreamingTransformerLayer<B>>,
 }
 
+/// Streaming state for the transformer stack.
 #[derive(Debug, Clone)]
 pub struct StreamingTransformerState<B: Backend> {
     pub layers: Vec<StreamingTransformerLayerState<B>>,
 }
 
 impl<B: Backend + 'static> StreamingTransformer<B> {
+    /// Construct a transformer stack from config.
     pub fn new(config: StreamingTransformerConfig, device: &B::Device) -> Self {
         let mut layers = Vec::with_capacity(config.num_layers);
         for _ in 0..config.num_layers {
@@ -187,6 +213,7 @@ impl<B: Backend + 'static> StreamingTransformer<B> {
         Self { layers }
     }
 
+    /// Forward pass through the transformer stack.
     pub fn forward(
         &self,
         mut input: Tensor<B, 3>,
@@ -202,6 +229,7 @@ impl<B: Backend + 'static> StreamingTransformer<B> {
 impl<B: Backend + 'static> StreamingModule<B> for StreamingTransformer<B> {
     type State = StreamingTransformerState<B>;
 
+    /// Initialize streaming state for all layers.
     fn init_state(&self, batch_size: usize, sequence_length: usize) -> Self::State {
         let layers = self
             .layers
@@ -211,6 +239,7 @@ impl<B: Backend + 'static> StreamingModule<B> for StreamingTransformer<B> {
         StreamingTransformerState { layers }
     }
 
+    /// Increment all layer step counters.
     fn increment_step(&self, state: &mut Self::State, increment: usize) {
         for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
             layer.increment_step(layer_state, increment);
@@ -218,14 +247,20 @@ impl<B: Backend + 'static> StreamingModule<B> for StreamingTransformer<B> {
     }
 }
 
+/// Configuration for a transformer with input/output projections.
 #[derive(Debug, Clone)]
 pub struct ProjectedTransformerConfig {
+    /// Input feature dimension.
     pub input_dim: usize,
+    /// Transformer model dimension.
     pub model_dim: usize,
+    /// Output feature dimension.
     pub output_dim: usize,
+    /// Transformer stack configuration.
     pub transformer: StreamingTransformerConfig,
 }
 
+/// Transformer wrapper that projects inputs and outputs.
 #[derive(Debug, Clone)]
 pub struct ProjectedTransformer<B: Backend> {
     input_proj: Linear<B>,
@@ -234,6 +269,7 @@ pub struct ProjectedTransformer<B: Backend> {
 }
 
 impl<B: Backend> ProjectedTransformer<B> {
+    /// Construct a projected transformer from config.
     pub fn new(config: ProjectedTransformerConfig, device: &B::Device) -> Self {
         let input_proj = LinearConfig::new(config.input_dim, config.model_dim).init::<B>(device);
         let output_proj = LinearConfig::new(config.model_dim, config.output_dim).init::<B>(device);
@@ -245,6 +281,7 @@ impl<B: Backend> ProjectedTransformer<B> {
         }
     }
 
+    /// Forward pass with input/output projections.
     pub fn forward(
         &self,
         input: Tensor<B, 3>,
@@ -261,10 +298,12 @@ impl<B: Backend> ProjectedTransformer<B> {
 impl<B: Backend> StreamingModule<B> for ProjectedTransformer<B> {
     type State = StreamingTransformerState<B>;
 
+    /// Initialize streaming state for the underlying transformer.
     fn init_state(&self, batch_size: usize, sequence_length: usize) -> Self::State {
         self.transformer.init_state(batch_size, sequence_length)
     }
 
+    /// Increment all transformer layer positions.
     fn increment_step(&self, state: &mut Self::State, increment: usize) {
         self.transformer.increment_step(state, increment);
     }
@@ -273,8 +312,7 @@ impl<B: Backend> StreamingModule<B> for ProjectedTransformer<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::module::Param;
-    use burn::tensor::TensorData;
+    use burn::{module::Param, tensor::TensorData as BurnTensorData};
     use burn_ndarray::{NdArray, NdArrayDevice};
     use serde::Deserialize;
     use std::fs;
@@ -282,6 +320,7 @@ mod tests {
 
     type TestBackend = NdArray<f32>;
 
+    /// Create a deterministic input tensor for testing.
     fn make_input(
         device: &NdArrayDevice,
         batch: usize,
@@ -297,10 +336,11 @@ mod tests {
                 }
             }
         }
-        let data = TensorData::new(data, [batch, seq, dim]);
+        let data = BurnTensorData::new(data, [batch, seq, dim]);
         Tensor::from_data(data, device)
     }
 
+    /// Compute the maximum absolute difference between two tensors.
     fn max_abs_diff(a: Tensor<TestBackend, 3>, b: Tensor<TestBackend, 3>) -> f32 {
         let a = a.to_data();
         let b = b.to_data();
@@ -314,6 +354,7 @@ mod tests {
     }
 
     #[derive(Debug, Deserialize)]
+    /// Full transformer fixture with config, weights, inputs, and outputs.
     struct TransformerFixture {
         config: TransformerFixtureConfig,
         weights: TransformerWeights,
@@ -322,6 +363,7 @@ mod tests {
     }
 
     #[derive(Debug, Deserialize)]
+    /// Minimal transformer config used by fixtures.
     struct TransformerFixtureConfig {
         d_model: usize,
         num_heads: usize,
@@ -330,6 +372,7 @@ mod tests {
     }
 
     #[derive(Debug, Deserialize)]
+    /// Weight bundle for a transformer layer.
     struct TransformerWeights {
         norm1: NormWeights,
         norm2: NormWeights,
@@ -340,17 +383,20 @@ mod tests {
     }
 
     #[derive(Debug, Deserialize)]
+    /// Linear layer weights used in fixtures.
     struct LinearWeights {
         weight: Vec<Vec<f32>>,
         bias: Vec<f32>,
     }
 
     #[derive(Debug, Deserialize)]
+    /// LayerNorm weights used in fixtures.
     struct NormWeights {
         gamma: Vec<f32>,
         beta: Vec<f32>,
     }
 
+    /// Resolve a fixture file path under `tests/fixtures`.
     fn fixture_path(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -358,20 +404,23 @@ mod tests {
             .join(name)
     }
 
+    /// Load a transformer fixture JSON file.
     fn load_fixture(name: &str) -> TransformerFixture {
         let data = fs::read_to_string(fixture_path(name)).expect("fixture read");
         serde_json::from_str(&data).expect("fixture parse")
     }
 
+    /// Build a 3D tensor from nested vectors.
     fn tensor3(device: &NdArrayDevice, data: Vec<Vec<Vec<f32>>>) -> Tensor<TestBackend, 3> {
         let b = data.len();
         let t = data[0].len();
         let d = data[0][0].len();
         let flat: Vec<f32> = data.into_iter().flatten().flatten().collect();
-        let td = TensorData::new(flat, [b, t, d]);
+        let td = BurnTensorData::new(flat, [b, t, d]);
         Tensor::from_data(td, device)
     }
 
+    /// Assign fixture weights to a linear layer.
     fn apply_linear(
         linear: &mut Linear<TestBackend>,
         weights: &LinearWeights,
@@ -380,26 +429,27 @@ mod tests {
         let rows = weights.weight.len();
         let cols = weights.weight.first().map(|row| row.len()).unwrap_or(0);
         let flat: Vec<f32> = weights.weight.clone().into_iter().flatten().collect();
-        let weight = Tensor::from_data(TensorData::new(flat, [rows, cols]), device);
+        let weight = Tensor::from_data(BurnTensorData::new(flat, [rows, cols]), device);
         linear.weight = Param::from_tensor(weight);
         let bias = Tensor::from_data(
-            TensorData::new(weights.bias.clone(), [weights.bias.len()]),
+            BurnTensorData::new(weights.bias.clone(), [weights.bias.len()]),
             device,
         );
         linear.bias = Some(Param::from_tensor(bias));
     }
 
+    /// Assign fixture weights to a layer norm.
     fn apply_norm(
         norm: &mut LayerNorm<TestBackend>,
         weights: &NormWeights,
         device: &NdArrayDevice,
     ) {
         let gamma = Tensor::from_data(
-            TensorData::new(weights.gamma.clone(), [weights.gamma.len()]),
+            BurnTensorData::new(weights.gamma.clone(), [weights.gamma.len()]),
             device,
         );
         let beta = Tensor::from_data(
-            TensorData::new(weights.beta.clone(), [weights.beta.len()]),
+            BurnTensorData::new(weights.beta.clone(), [weights.beta.len()]),
             device,
         );
         norm.gamma = Param::from_tensor(gamma);
@@ -514,6 +564,8 @@ mod tests {
             num_heads: fixture.config.num_heads,
             ffn_dim: fixture.config.ffn_dim,
             causal: fixture.config.causal,
+            // Fixtures were generated without RoPE; clamp positions to disable rotation.
+            rope_max_seq: Some(0),
             ..Default::default()
         };
         let mut layer = StreamingTransformerLayer::<TestBackend>::new(config, &device);

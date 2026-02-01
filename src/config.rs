@@ -8,92 +8,147 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Flow matching configuration (dimensionality and depth).
 pub struct FlowConfig {
+    /// Hidden size inside the flow network.
     pub dim: i64,
+    /// Number of residual blocks.
     pub depth: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Transformer hyperparameters for the FlowLM backbone.
 pub struct FlowLmTransformerConfig {
+    /// Feed-forward expansion factor.
     pub hidden_scale: i64,
+    /// RoPE base period.
     pub max_period: i64,
+    /// Model width.
     pub d_model: i64,
+    /// Number of attention heads.
     pub num_heads: i64,
+    /// Number of transformer layers.
     pub num_layers: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Lookup-table tokenizer and embedding settings.
 pub struct LookupTableConfig {
+    /// Embedding dimension for token IDs.
     pub dim: i64,
+    /// Vocabulary size (number of bins).
     pub n_bins: i64,
+    /// Tokenizer name (informational).
     pub tokenizer: String,
+    /// Path or `hf://` URL to SentencePiece model.
     pub tokenizer_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Full FlowLM configuration and optional weights.
 pub struct FlowLmConfig {
+    /// Tensor dtype string (e.g., "f32", "bf16").
     pub dtype: String,
+    /// Flow network configuration.
     pub flow: FlowConfig,
+    /// Transformer configuration.
     pub transformer: FlowLmTransformerConfig,
+    /// Text lookup-table configuration.
     pub lookup_table: LookupTableConfig,
+    /// Optional weights path for FlowLM-only checkpoints.
     pub weights_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// SEANet encoder/decoder configuration for the Mimi codec.
 pub struct SeanetConfig {
+    /// Latent dimension produced by the encoder.
     pub dimension: i64,
+    /// Number of audio channels.
     pub channels: i64,
+    /// Base number of convolutional filters.
     pub n_filters: i64,
+    /// Residual layers per down/up block.
     pub n_residual_layers: i64,
+    /// Stride ratios for downsampling/upsampling.
     pub ratios: Vec<i64>,
+    /// First/last convolution kernel sizes.
     pub kernel_size: i64,
+    /// Residual block kernel size.
     pub residual_kernel_size: i64,
+    /// Final convolution kernel size.
     pub last_kernel_size: i64,
+    /// Dilation base for residual blocks.
     pub dilation_base: i64,
+    /// Padding mode string ("constant" or "replicate").
     pub pad_mode: String,
+    /// Compression factor inside residual blocks.
     pub compress: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Transformer settings used inside Mimi for temporal modeling.
 pub struct MimiTransformerConfig {
+    /// Model width.
     pub d_model: i64,
+    /// Input projection dimension.
     pub input_dimension: i64,
+    /// Output projection dimensions (one per head).
     pub output_dimensions: Vec<i64>,
+    /// Number of attention heads.
     pub num_heads: i64,
+    /// Number of transformer layers.
     pub num_layers: i64,
+    /// Optional LayerScale initialization value.
     pub layer_scale: f32,
+    /// Attention context length (0 for full).
     pub context: i64,
+    /// RoPE base period.
     #[serde(default = "default_mimi_max_period")]
     pub max_period: f32,
+    /// Feed-forward hidden size.
     pub dim_feedforward: i64,
 }
 
+/// Default RoPE max period for Mimi when not specified in config.
 fn default_mimi_max_period() -> f32 {
     10000.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Quantizer configuration for Mimi (used in weight shapes).
 pub struct QuantizerConfig {
+    /// Latent dimension.
     pub dimension: i64,
+    /// Output dimension used by dummy quantizer.
     pub output_dimension: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Mimi codec configuration and optional weights.
 pub struct MimiConfig {
+    /// Tensor dtype string (e.g., "f32", "bf16").
     pub dtype: String,
+    /// Audio sample rate in Hz.
     pub sample_rate: i64,
+    /// Number of audio channels.
     pub channels: i64,
+    /// Frame rate in Hz (latents per second).
     pub frame_rate: f32,
+    /// SEANet encoder/decoder configuration.
     pub seanet: SeanetConfig,
+    /// Transformer configuration.
     pub transformer: MimiTransformerConfig,
+    /// Quantizer configuration.
     pub quantizer: QuantizerConfig,
+    /// Optional weights path for Mimi-only checkpoints.
     pub weights_path: Option<String>,
 }
 
@@ -120,6 +175,7 @@ pub struct MimiConfig {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Top-level configuration for the full TTS stack.
 pub struct Config {
     /// FlowLM transformer configuration
     pub flow_lm: FlowLmConfig,
@@ -147,6 +203,7 @@ pub fn load_config(path: impl AsRef<Path>) -> anyhow::Result<Config> {
     Ok(config)
 }
 
+/// Resolve a possibly relative path against a config file location.
 pub fn resolve_relative_path(config_path: &Path, maybe_relative: &str) -> PathBuf {
     let candidate = Path::new(maybe_relative);
     if candidate.is_absolute() {

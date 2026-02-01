@@ -1,77 +1,40 @@
+//! Streaming state helpers shared across the TTS pipeline.
+//!
+//! This module defines tiny, generic building blocks used by streaming layers to
+//! track position and cache per-layer state as audio is generated frame by frame.
+
 use burn::tensor::backend::Backend;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone)]
-pub struct StreamStep {
-    pub index: usize,
-}
-
-impl StreamStep {
-    pub fn new() -> Self {
-        Self { index: 0 }
-    }
-
-    pub fn increment(&mut self, by: usize) {
-        self.index = self.index.saturating_add(by);
-    }
-}
-
-impl Default for StreamStep {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
+/// Trait implemented by streaming modules that keep per-request state.
 pub trait StreamingModule<B: Backend> {
+    /// Concrete state type for this module.
     type State;
 
+    /// Allocate a fresh state for a given batch and sequence length.
     fn init_state(&self, batch_size: usize, sequence_length: usize) -> Self::State;
+    /// Advance internal position tracking by `increment`.
     fn increment_step(&self, state: &mut Self::State, increment: usize);
 }
 
-#[derive(Debug, Default)]
-pub struct StateTree {
-    steps: HashMap<String, StreamStep>,
-}
-
-impl StateTree {
-    pub fn set_step(&mut self, key: impl Into<String>, step: StreamStep) {
-        self.steps.insert(key.into(), step);
-    }
-
-    pub fn step_mut(&mut self, key: &str) -> Option<&mut StreamStep> {
-        self.steps.get_mut(key)
-    }
-
-    pub fn step(&self, key: &str) -> Option<&StreamStep> {
-        self.steps.get(key)
-    }
-}
+/// Named collection of streaming step counters for nested modules.
+pub type StateTree = HashMap<String, usize>;
 
 #[cfg(test)]
 mod tests {
-    use super::{StateTree, StreamStep};
-
-    #[test]
-    fn stream_step_increments() {
-        let mut step = StreamStep::new();
-        step.increment(2);
-        assert_eq!(step.index, 2);
-        step.increment(0);
-        assert_eq!(step.index, 2);
-    }
+    use super::StateTree;
 
     #[test]
     fn state_tree_gets_and_sets() {
         let mut tree = StateTree::default();
-        assert!(tree.step("missing").is_none());
+        assert!(tree.get("missing").is_none());
 
-        tree.set_step("flow", StreamStep { index: 5 });
-        assert_eq!(tree.step("flow").map(|s| s.index), Some(5));
+        tree.insert("flow".to_string(), 5);
+        assert_eq!(tree.get("flow").copied(), Some(5));
 
-        if let Some(step) = tree.step_mut("flow") {
-            step.increment(3);
+        if let Some(step) = tree.get_mut("flow") {
+            *step = step.saturating_add(3);
         }
-        assert_eq!(tree.step("flow").map(|s| s.index), Some(8));
+        assert_eq!(tree.get("flow").copied(), Some(8));
     }
 }

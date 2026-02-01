@@ -1,97 +1,138 @@
+//! Command-line interface for the Rust TTS implementation.
+//!
+//! The CLI wraps the core model to provide speech synthesis, voice encoding,
+//! model downloads, and basic audio conversion utilities.
+
 use anyhow::Result;
-use burn::tensor::{Int, Tensor, TensorData};
+use burn::tensor::{Tensor, TensorData};
 use burn_ndarray::{NdArray, NdArrayDevice};
 use clap::{Parser, Subcommand};
 use guth::audio::io::StreamingWavWriter;
 use guth::audio::io::WavIo;
 use guth::audio::resample::AudioResampler;
-use guth::conditioner::text::TextTokenizer;
 use guth::config::load_config;
-use guth::model::tts::TtsModel;
+use guth::runtime::{RuntimeParams, TtsRuntime};
 use safetensors::Dtype;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// Top-level CLI options.
 #[derive(Parser)]
 #[command(name = "guth")]
 #[command(about = "Rust rewrite of pocket-tts", long_about = None)]
 struct Cli {
+    /// Subcommand to execute.
     #[command(subcommand)]
     command: Commands,
 }
 
+/// CLI subcommands.
 #[derive(Subcommand)]
 enum Commands {
+    /// Generate speech from text.
     Say {
+        /// Text prompt to synthesize.
         text: String,
+        /// Name of a precomputed voice embedding.
         #[arg(long)]
         voice: Option<String>,
+        /// Path to a custom voice audio file.
         #[arg(long)]
         voice_file: Option<PathBuf>,
+        /// Output WAV file path.
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Model configuration YAML.
         #[arg(long, default_value = "python/pocket_tts/config/b6369a24.yaml")]
         config: PathBuf,
+        /// Sampling temperature.
         #[arg(long)]
         temp: Option<f32>,
+        /// Langevin decode steps.
         #[arg(long)]
         lsd_decode_steps: Option<usize>,
+        /// Optional noise clamp.
         #[arg(long)]
         noise_clamp: Option<f32>,
+        /// End-of-sequence threshold.
         #[arg(long)]
         eos_threshold: Option<f32>,
+        /// Maximum latent frames to generate.
         #[arg(long)]
         max_gen_len: Option<usize>,
+        /// Frames to continue after EOS detection.
         #[arg(long)]
         frames_after_eos: Option<usize>,
+        /// Stream audio to disk as it is generated.
         #[arg(long)]
         stream: bool,
+        /// Print per-chunk progress for streaming.
         #[arg(long)]
         progress: bool,
     },
+    /// List available voices.
     Voices,
+    /// Voice-related subcommands.
     Voice {
+        /// Voice subcommand to execute.
         #[command(subcommand)]
         command: VoiceCommands,
     },
+    /// List available models.
     Models,
+    /// Download model artifacts.
     Download {
+        /// Model name to download.
         model: String,
     },
+    /// Audio utility subcommands.
     Audio {
+        /// Audio subcommand to execute.
         #[command(subcommand)]
         command: AudioCommands,
     },
 }
 
+/// Audio utility commands.
 #[derive(Subcommand)]
 enum AudioCommands {
+    /// Convert sample rate and channel count.
     Convert {
+        /// Input audio file path.
         #[arg(long)]
         input: PathBuf,
+        /// Output WAV path.
         #[arg(long)]
         output: PathBuf,
+        /// Target sample rate in Hz.
         #[arg(long)]
         to_rate: u32,
+        /// Target channel count.
         #[arg(long)]
         to_channels: usize,
     },
 }
 
+/// Voice-related commands.
 #[derive(Subcommand)]
 enum VoiceCommands {
+    /// Encode a voice prompt to a conditioning tensor.
     Encode {
+        /// Input audio file.
         #[arg(long)]
         input: PathBuf,
+        /// Output safetensors path.
         #[arg(long)]
         output: PathBuf,
+        /// Model configuration YAML.
         #[arg(long, default_value = "python/pocket_tts/config/b6369a24.yaml")]
         config: PathBuf,
     },
 }
 
+/// Entry point for the CLI.
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -117,36 +158,20 @@ fn main() -> Result<()> {
                 interrupt_flag.store(true, Ordering::SeqCst);
             })?;
             let config_path = resolve_config_path(config);
-            let cfg = load_config(&config_path)?;
             let device = NdArrayDevice::default();
-            let tts = TtsModel::<NdArray<f32>>::from_config(
-                &cfg,
+            let params = RuntimeParams::new(
                 temp.unwrap_or(0.0),
                 lsd_decode_steps.unwrap_or(2),
                 noise_clamp,
                 eos_threshold.unwrap_or(-4.0),
-                &device,
-            )?;
-
-            let tokenizer = tts
-                .flow_lm
-                .conditioner
-                .tokenizer
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Tokenizer not loaded"))?;
-            let (prepared, frames_after_eos_guess) = TextTokenizer::prepare_text_prompt(&text)?;
-            let tokens = tokenizer.encode(&prepared)?;
-            let tokens = tokens.into_iter().map(|v| v as i64).collect::<Vec<_>>();
-            let tokens_len = tokens.len();
-            let tokens = Tensor::<NdArray<f32>, 2, Int>::from_data(
-                TensorData::new(tokens, [1, tokens_len]),
-                &device,
             );
+            let runtime =
+                TtsRuntime::<NdArray<f32>>::from_config_path(&config_path, params, &device)?;
+            let (tokens, frames_after_eos_guess) = runtime.prepare_tokens(&text)?;
 
             let max_gen_len = max_gen_len.unwrap_or(256);
             let frames_after_eos = frames_after_eos.unwrap_or(frames_after_eos_guess);
-            let mut state =
-                tts.init_state(1, tokens.dims()[1] + max_gen_len + 1, max_gen_len, &device);
+            let mut state = runtime.init_state_for_tokens(&tokens, max_gen_len);
 
             // Apply voice conditioning if specified
             if let Some(voice_name) = voice {
@@ -157,23 +182,17 @@ fn main() -> Result<()> {
                     )
                 })?;
                 let conditioning = load_conditioning_tensor(&voice_path, &device)?;
-                tts.condition_on_precomputed(conditioning, &mut state)?;
+                runtime.condition_on_precomputed(conditioning, &mut state)?;
             } else if let Some(voice_path) = voice_file {
                 // Custom voice file - compute conditioning from audio
-                let (samples, sample_rate) = WavIo::read_audio(&voice_path)?;
-                let prompt = AudioResampler::convert_audio(
-                    samples,
-                    sample_rate,
-                    cfg.mimi.sample_rate as u32,
-                    cfg.mimi.channels as usize,
-                )?;
-                let prompt_tensor = tensor_from_audio(prompt, &device);
-                tts.condition_on_audio(prompt_tensor, &mut state)?;
+                runtime.condition_on_audio_path(&voice_path, &mut state)?;
             }
 
             let output_path = output.ok_or_else(|| anyhow::anyhow!("--output is required"))?;
+            let sample_rate = runtime.config().mimi.sample_rate as u32;
+            let channels = runtime.config().mimi.channels as usize;
             if stream {
-                let receiver = tts.generate_audio_stream_with_state(
+                let receiver = runtime.generate_audio_stream_with_state(
                     tokens,
                     state,
                     max_gen_len,
@@ -181,8 +200,8 @@ fn main() -> Result<()> {
                 );
                 let mut writer = StreamingWavWriter::create(
                     output_path,
-                    cfg.mimi.sample_rate as u32,
-                    cfg.mimi.channels as usize,
+                    sample_rate,
+                    channels,
                 )?;
                 for (chunk_idx, chunk) in receiver.into_iter().enumerate() {
                     if interrupted.load(Ordering::SeqCst) {
@@ -197,7 +216,7 @@ fn main() -> Result<()> {
                 }
                 writer.finalize()?;
             } else {
-                let (_latents, _eos, audio) = tts.generate_audio_from_tokens(
+                let (_latents, _eos, audio) = runtime.generate_audio_from_tokens(
                     tokens,
                     &mut state,
                     max_gen_len,
@@ -207,7 +226,7 @@ fn main() -> Result<()> {
                     anyhow::bail!("Interrupted");
                 }
                 let audio_vec = audio_to_vec(audio);
-                WavIo::write_wav(output_path, &audio_vec, cfg.mimi.sample_rate as u32)?;
+                WavIo::write_wav(output_path, &audio_vec, sample_rate)?;
             }
         }
         Commands::Voices => {
@@ -227,18 +246,14 @@ fn main() -> Result<()> {
                 output,
                 config,
             } => {
-                let cfg = load_config(resolve_config_path(config))?;
                 let device = NdArrayDevice::default();
-                let tts = TtsModel::<NdArray<f32>>::from_config(&cfg, 0.0, 2, None, 0.0, &device)?;
-                let (samples, sample_rate) = WavIo::read_audio(input)?;
-                let prompt = AudioResampler::convert_audio(
-                    samples,
-                    sample_rate,
-                    cfg.mimi.sample_rate as u32,
-                    cfg.mimi.channels as usize,
+                let params = RuntimeParams::new(0.0, 2, None, 0.0);
+                let runtime = TtsRuntime::<NdArray<f32>>::from_config_path(
+                    resolve_config_path(config),
+                    params,
+                    &device,
                 )?;
-                let prompt_tensor = tensor_from_audio(prompt, &device);
-                let conditioning = compute_conditioning(&tts, prompt_tensor);
+                let conditioning = runtime.conditioning_from_audio_path(input)?;
                 save_tensor(&output, "conditioning", conditioning)?;
             }
         },
@@ -268,16 +283,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn tensor_from_audio(samples: Vec<Vec<f32>>, device: &NdArrayDevice) -> Tensor<NdArray<f32>, 3> {
-    let channels = samples.len();
-    let len = samples[0].len();
-    let mut flat = Vec::with_capacity(channels * len);
-    for channel in samples {
-        flat.extend(channel);
-    }
-    Tensor::from_data(TensorData::new(flat, [1, channels, len]), device)
-}
-
+/// Convert a `[1, channels, samples]` tensor into per-channel vectors.
 fn audio_to_vec(audio: Tensor<NdArray<f32>, 3>) -> Vec<Vec<f32>> {
     let data = audio.to_data();
     let values = data.as_slice::<f32>().expect("audio data");
@@ -295,15 +301,7 @@ fn audio_to_vec(audio: Tensor<NdArray<f32>, 3>) -> Vec<Vec<f32>> {
     output
 }
 
-fn compute_conditioning(
-    tts: &TtsModel<NdArray<f32>>,
-    audio_prompt: Tensor<NdArray<f32>, 3>,
-) -> Tensor<NdArray<f32>, 3> {
-    let latents = tts.mimi.encode_to_latent(audio_prompt);
-    let latents = latents.swap_dims(1, 2);
-    burn::tensor::module::linear(latents, tts.speaker_proj_weight.clone(), None)
-}
-
+/// Save a 3D tensor to a SafeTensors file.
 fn save_tensor(path: &PathBuf, name: &str, tensor: Tensor<NdArray<f32>, 3>) -> Result<()> {
     let data = tensor.to_data();
     let values = data.as_slice::<f32>().expect("tensor data");
@@ -319,6 +317,7 @@ fn save_tensor(path: &PathBuf, name: &str, tensor: Tensor<NdArray<f32>, 3>) -> R
     Ok(())
 }
 
+/// Load a conditioning tensor from a SafeTensors file.
 fn load_conditioning_tensor(
     path: &PathBuf,
     device: &NdArrayDevice,
@@ -342,31 +341,30 @@ fn load_conditioning_tensor(
     ))
 }
 
+/// Resolve a built-in voice name to an on-disk file path.
 fn resolve_voice_path(voice_name: &str) -> Option<PathBuf> {
-    // Try multiple locations for voice files
-    let candidates = [
-        format!("voices/{voice_name}.safetensors"),
-        format!("voices/{voice_name}.safetensors"),
-    ];
-    for candidate in candidates {
-        let path = PathBuf::from(&candidate);
-        if path.exists() {
-            return Some(path);
-        }
+    // Resolve precomputed voices from the repository voices directory.
+    let candidate = format!("voices/{voice_name}.safetensors");
+    let path = PathBuf::from(&candidate);
+    if path.exists() {
+        return Some(path);
     }
     None
 }
 
+/// Return the list of known model names.
 fn available_models() -> Vec<&'static str> {
     vec!["b6369a24"]
 }
 
+/// Return the list of built-in voice names.
 fn available_voices() -> Vec<&'static str> {
     vec![
         "alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma",
     ]
 }
 
+/// Download model artifacts referenced by the config.
 fn download_model(model: &str) -> Result<()> {
     let config_path = match model {
         "b6369a24" => PathBuf::from("python/pocket_tts/config/b6369a24.yaml"),
@@ -391,6 +389,7 @@ fn download_model(model: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a config path, falling back to parent directory if needed.
 fn resolve_config_path(path: PathBuf) -> PathBuf {
     if path.exists() {
         return path;

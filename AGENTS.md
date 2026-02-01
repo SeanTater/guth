@@ -97,6 +97,7 @@ This is a pure Python package with Rust extensions in `training/rust_exts/audio_
 - **Plans not checked in**: `.plans/` is ignored; update locally but don’t commit unless explicitly asked.
 - **Scratch space**: put temporary files and cloned repos in `/scratch/` (ignored by git).
 - **Commit/push cadence**: commit and push at each meaningful step (tests first, then implementation).
+- **Commit size**: aim to keep commits under 1000 LOC by committing more frequently.
 
 ### Key Patterns
 

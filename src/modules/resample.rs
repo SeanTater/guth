@@ -1,30 +1,42 @@
+//! Lightweight resampling blocks used inside Mimi when frame rates differ.
+//!
+//! These are small wrapper modules around streaming convolution ops.
+
 use crate::modules::streaming_conv::{
     PaddingMode, StreamingConv1dOp, StreamingConvConfig, StreamingConvState,
     StreamingConvTranspose1dOp,
 };
-use burn::tensor::backend::Backend;
-use burn::tensor::Tensor;
+use burn::tensor::{backend::Backend, Tensor};
 
+/// Downsample using a fixed-stride 1D convolution.
 #[derive(Debug, Clone)]
 pub struct ConvDownsample1d<B: Backend> {
+    /// Underlying streaming convolution op.
     pub conv: StreamingConv1dOp<B>,
 }
 
+/// Streaming state for [`ConvDownsample1d`].
 #[derive(Debug, Clone)]
 pub struct ConvDownsample1dState<B: Backend> {
+    /// Convolution state (history buffer + step).
     pub conv: StreamingConvState<B>,
 }
 
+/// Upsample using a transposed 1D convolution.
 #[derive(Debug, Clone)]
 pub struct ConvTrUpsample1d<B: Backend> {
+    /// Underlying streaming transpose convolution op.
     pub conv: StreamingConvTranspose1dOp<B>,
 }
 
+/// Streaming state for [`ConvTrUpsample1d`].
 #[derive(Debug, Clone)]
 pub struct ConvTrUpsample1dState<B: Backend> {
+    /// Convolution state (history buffer + step).
     pub conv: StreamingConvState<B>,
 }
 
+/// Initialize streaming conv state for a downsample op.
 fn init_conv_state<B: Backend>(
     config: &StreamingConvConfig,
     batch_size: usize,
@@ -44,6 +56,7 @@ fn init_conv_state<B: Backend>(
     state
 }
 
+/// Initialize streaming conv state for an upsample op.
 fn init_conv_transpose_state<B: Backend>(
     config: &StreamingConvConfig,
     batch_size: usize,
@@ -63,6 +76,7 @@ fn init_conv_transpose_state<B: Backend>(
 }
 
 impl<B: Backend> ConvDownsample1d<B> {
+    /// Create a downsample op with a stride and weight tensor.
     pub fn new(stride: usize, weight: Tensor<B, 3>) -> Self {
         let config = StreamingConvConfig {
             kernel_size: 2 * stride,
@@ -77,12 +91,14 @@ impl<B: Backend> ConvDownsample1d<B> {
         }
     }
 
+    /// Initialize streaming state for this downsample op.
     pub fn init_state(&self, batch_size: usize, device: &B::Device) -> ConvDownsample1dState<B> {
         let in_channels = self.conv.weight.dims()[1];
         let state = init_conv_state(&self.conv.config, batch_size, in_channels, device);
         ConvDownsample1dState { conv: state }
     }
 
+    /// Apply downsampling to an input chunk.
     pub fn forward(
         &self,
         input: Tensor<B, 3>,
@@ -93,6 +109,7 @@ impl<B: Backend> ConvDownsample1d<B> {
 }
 
 impl<B: Backend> ConvTrUpsample1d<B> {
+    /// Create an upsample op with a stride and weight tensor.
     pub fn new(stride: usize, weight: Tensor<B, 3>, groups: usize) -> Self {
         let config = StreamingConvConfig {
             kernel_size: 2 * stride,
@@ -107,12 +124,14 @@ impl<B: Backend> ConvTrUpsample1d<B> {
         }
     }
 
+    /// Initialize streaming state for this upsample op.
     pub fn init_state(&self, batch_size: usize, device: &B::Device) -> ConvTrUpsample1dState<B> {
         let out_channels = self.conv.weight.dims()[1] * self.conv.config.groups;
         let state = init_conv_transpose_state(&self.conv.config, batch_size, out_channels, device);
         ConvTrUpsample1dState { conv: state }
     }
 
+    /// Apply upsampling to an input chunk.
     pub fn forward(
         &self,
         input: Tensor<B, 3>,

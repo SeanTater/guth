@@ -89,6 +89,7 @@ impl TextTokenizer {
         Ok((text, frames_after_eos_guess))
     }
 
+    /// Split long text into sentence-like chunks with a token budget.
     pub fn split_into_best_sentences(&self, text: &str, max_tokens: usize) -> Result<Vec<String>> {
         let (text, _) = Self::prepare_text_prompt(text)?;
         let text = text.trim();
@@ -152,6 +153,7 @@ impl TextTokenizer {
     }
 }
 
+/// Lookup-table conditioner that embeds token IDs for the transformer.
 #[derive(Debug)]
 pub struct LutConditioner<B: Backend> {
     pub tokenizer: Option<TextTokenizer>,
@@ -161,6 +163,7 @@ pub struct LutConditioner<B: Backend> {
 }
 
 impl<B: Backend> LutConditioner<B> {
+    /// Create a new LUT conditioner and load its tokenizer.
     pub fn new(
         n_bins: usize,
         tokenizer_path: impl AsRef<std::path::Path>,
@@ -178,6 +181,7 @@ impl<B: Backend> LutConditioner<B> {
         })
     }
 
+    /// Embed token IDs into model space.
     pub fn forward_tokens(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         self.embed.forward(tokens)
     }
@@ -191,6 +195,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[derive(Debug, Deserialize)]
+    /// Tokenizer fixture with model path and cases.
     struct TokenizerFixture {
         model_file: String,
         cases: Vec<TokenizerCase>,
@@ -198,6 +203,7 @@ mod tests {
     }
 
     #[derive(Debug, Deserialize)]
+    /// Expected behavior for a single text prompt.
     struct TokenizerCase {
         text: String,
         prepared: String,
@@ -207,12 +213,14 @@ mod tests {
     }
 
     #[derive(Debug, Deserialize)]
+    /// Expected sentence splitting behavior for a prompt.
     struct SplitCase {
         text: String,
         max_tokens: usize,
         chunks: Vec<String>,
     }
 
+    /// Resolve a fixture file path under `tests/fixtures`.
     fn fixture_path(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -220,6 +228,7 @@ mod tests {
             .join(name)
     }
 
+    /// Load the tokenizer fixture JSON.
     fn load_fixture() -> TokenizerFixture {
         let data =
             fs::read_to_string(fixture_path("tokenizer_fixture.json")).expect("fixture read");

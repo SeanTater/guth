@@ -26,39 +26,26 @@ burn-ndarray = "0.20"  # or another Burn backend
 
 ## Quick Start
 
+Use `TtsRuntime` for a convenience wrapper around config + model loading:
+
 ```rust
 use burn_ndarray::{NdArray, NdArrayDevice};
-use burn::tensor::{Int, Tensor, TensorData};
-use guth::{load_config, TtsModel, TextTokenizer};
+use guth::{load_config, RuntimeParams, TtsRuntime};
 
 // Load model from config
 let config = load_config("config.yaml")?;
 let device = NdArrayDevice::default();
-let tts = TtsModel::<NdArray<f32>>::from_config(
-    &config,
-    0.7,   // temperature
-    2,     // LSD decode steps
-    None,  // noise clamp
-    0.0,   // EOS threshold
-    &device,
-)?;
+let params = RuntimeParams::new(0.7, 2, None, 0.0);
+let runtime = TtsRuntime::<NdArray<f32>>::from_config(&config, params, &device)?;
 
 // Prepare and tokenize text
-let tokenizer = tts.flow_lm.conditioner.tokenizer.as_ref().unwrap();
-let (prepared, frames_after_eos) = TextTokenizer::prepare_text_prompt("Hello, world!")?;
-let tokens = tokenizer.encode(&prepared)?;
-let tokens: Vec<i64> = tokens.into_iter().map(|t| t as i64).collect();
-let tokens = Tensor::<NdArray<f32>, 2, Int>::from_data(
-    TensorData::new(tokens.clone(), [1, tokens.len()]),
-    &device,
-);
+let (tokens, frames_after_eos) = runtime.prepare_tokens("Hello, world!")?;
 
 // Generate audio
 let max_gen_len = 256;
-let mut state = tts.init_state(1, tokens.dims()[1] + max_gen_len + 1, max_gen_len, &device);
-let (_latents, _eos, audio) = tts.generate_audio_from_tokens(
-    tokens, &mut state, max_gen_len, frames_after_eos,
-)?;
+let mut state = runtime.init_state_for_tokens(&tokens, max_gen_len);
+let (_latents, _eos, audio) =
+    runtime.generate_audio_from_tokens(tokens, &mut state, max_gen_len, frames_after_eos)?;
 // audio shape: [batch, channels, samples]
 ```
 
@@ -67,7 +54,9 @@ let (_latents, _eos, audio) = tts.generate_audio_from_tokens(
 For real-time applications:
 
 ```rust
-let receiver = tts.generate_audio_stream(tokens, 256, 8);
+// Assume `runtime` is created as in Quick Start
+let (tokens, frames_after_eos) = runtime.prepare_tokens("Hello from streaming!")?;
+let receiver = runtime.generate_audio_stream(tokens, 256, frames_after_eos);
 for audio_chunk in receiver {
     // Process each chunk as it arrives
 }
@@ -78,9 +67,11 @@ for audio_chunk in receiver {
 Condition on reference audio for voice cloning:
 
 ```rust
-let mut state = tts.init_state(1, 512, 256, &device);
-tts.condition_on_audio(reference_audio, &mut state)?;
-let receiver = tts.generate_audio_stream_with_state(tokens, state, 256, 8);
+// Assume `runtime` is created as in Quick Start
+let (tokens, frames_after_eos) = runtime.prepare_tokens("Voice cloning example")?;
+let mut state = runtime.init_state_for_tokens(&tokens, 256);
+runtime.condition_on_audio_path("voice.wav", &mut state)?;
+let receiver = runtime.generate_audio_stream_with_state(tokens, state, 256, frames_after_eos);
 ```
 
 ## Configuration

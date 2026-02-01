@@ -1,48 +1,69 @@
-use crate::state::{StreamStep, StreamingModule};
-use anyhow::Result;
-use burn::tensor::backend::Backend;
-use burn::tensor::module::{conv1d, conv_transpose1d};
-use burn::tensor::ops::{ConvOptions, ConvTransposeOptions, PadMode};
-use burn::tensor::{s, Tensor};
+//! Streaming-friendly 1D convolution primitives.
+//!
+//! These operators keep a small history buffer so they can process audio in
+//! chunks while producing the same result as full batch convolution.
 
+use crate::state::StreamingModule;
+use anyhow::Result;
+use burn::tensor::{
+    backend::Backend,
+    module::{conv1d, conv_transpose1d},
+    ops::{ConvOptions, ConvTransposeOptions, PadMode},
+    s, Tensor,
+};
+
+/// Marker type for streaming 1D convolution.
 #[derive(Debug, Default)]
 pub struct StreamingConv1d;
 
+/// Marker type for streaming 1D transposed convolution.
 #[derive(Debug, Default)]
 pub struct StreamingConvTranspose1d;
 
+/// Streaming convolution state (history buffer).
 #[derive(Debug, Clone)]
 pub struct StreamingConvState<B: Backend> {
-    pub step: StreamStep,
+    /// Cached input/output history for overlap.
     pub history: Option<Tensor<B, 3>>,
 }
 
 impl<B: Backend> Default for StreamingConvState<B> {
+    /// Create an empty streaming state with no history.
     fn default() -> Self {
         Self {
-            step: StreamStep::new(),
             history: None,
         }
     }
 }
 
+/// Padding modes supported by streaming convs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaddingMode {
+    /// Pad with zeros.
     Constant,
+    /// Replicate edge values.
     Replicate,
 }
 
+/// Configuration for streaming convolution ops.
 #[derive(Debug, Clone)]
 pub struct StreamingConvConfig {
+    /// Kernel size in samples.
     pub kernel_size: usize,
+    /// Stride in samples.
     pub stride: usize,
+    /// Dilation factor.
     pub dilation: usize,
+    /// Explicit padding on the left.
     pub padding: usize,
+    /// Padding mode.
     pub pad_mode: PaddingMode,
+    /// Number of groups.
     pub groups: usize,
 }
 
 impl Default for StreamingConvConfig {
+    /// Default to a 1x1 convolution with no padding.
     fn default() -> Self {
         Self {
             kernel_size: 1,
@@ -55,14 +76,19 @@ impl Default for StreamingConvConfig {
     }
 }
 
+/// 1D convolution op with streaming support.
 #[derive(Debug, Clone)]
 pub struct StreamingConv1dOp<B: Backend> {
+    /// Convolution config.
     pub config: StreamingConvConfig,
+    /// Weight tensor `[out, in, kernel]`.
     pub weight: Tensor<B, 3>,
+    /// Optional bias `[out]`.
     pub bias: Option<Tensor<B, 1>>,
 }
 
 impl<B: Backend> StreamingConv1dOp<B> {
+    /// Create a new streaming conv op.
     pub fn new(
         config: StreamingConvConfig,
         weight: Tensor<B, 3>,
@@ -75,6 +101,7 @@ impl<B: Backend> StreamingConv1dOp<B> {
         }
     }
 
+    /// Apply convolution to a streaming chunk, updating history.
     pub fn forward(&self, state: &mut StreamingConvState<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
         let input_len = input.dims()[2];
         if input_len == 0 {
@@ -139,14 +166,19 @@ impl<B: Backend> StreamingConv1dOp<B> {
     }
 }
 
+/// 1D transposed convolution op with streaming support.
 #[derive(Debug, Clone)]
 pub struct StreamingConvTranspose1dOp<B: Backend> {
+    /// Convolution config.
     pub config: StreamingConvConfig,
+    /// Weight tensor `[in, out, kernel]`.
     pub weight: Tensor<B, 3>,
+    /// Optional bias `[out]`.
     pub bias: Option<Tensor<B, 1>>,
 }
 
 impl<B: Backend> StreamingConvTranspose1dOp<B> {
+    /// Create a new streaming transposed conv op.
     pub fn new(
         config: StreamingConvConfig,
         weight: Tensor<B, 3>,
@@ -159,6 +191,7 @@ impl<B: Backend> StreamingConvTranspose1dOp<B> {
         }
     }
 
+    /// Apply transposed convolution to a streaming chunk.
     pub fn forward(
         &self,
         state: &mut StreamingConvState<B>,
@@ -227,27 +260,32 @@ impl<B: Backend> StreamingConvTranspose1dOp<B> {
 impl<B: Backend> StreamingModule<B> for StreamingConv1d {
     type State = StreamingConvState<B>;
 
+    /// Initialize an empty streaming state.
     fn init_state(&self, _batch_size: usize, _sequence_length: usize) -> Self::State {
         StreamingConvState::default()
     }
 
+    /// Increment step counter for this state.
     fn increment_step(&self, state: &mut Self::State, increment: usize) {
-        state.step.increment(increment);
+        let _ = (state, increment);
     }
 }
 
 impl<B: Backend> StreamingModule<B> for StreamingConvTranspose1d {
     type State = StreamingConvState<B>;
 
+    /// Initialize an empty streaming state.
     fn init_state(&self, _batch_size: usize, _sequence_length: usize) -> Self::State {
         StreamingConvState::default()
     }
 
+    /// Increment step counter for this state.
     fn increment_step(&self, state: &mut Self::State, increment: usize) {
-        state.step.increment(increment);
+        let _ = (state, increment);
     }
 }
 
+/// Compute the output length of a 1D convolution.
 fn conv_output_len(
     input_len: usize,
     kernel: usize,

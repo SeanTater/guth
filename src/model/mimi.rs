@@ -1,33 +1,51 @@
-use crate::config::{MimiConfig, SeanetConfig};
-use crate::modules::dummy_quantizer::DummyQuantizer;
-use crate::modules::mimi_transformer::{
-    MimiProjectedTransformer, MimiTransformerState, ProjectedOutput,
+//! Mimi neural codec wrapper (encoder/decoder + transformer).
+//!
+//! Mimi compresses audio into latent frames and reconstructs waveforms from those
+//! frames. This module provides the Rust-side model and weight loading logic.
+
+use crate::{
+    config::{MimiConfig, SeanetConfig},
+    modules::{
+        dummy_quantizer::DummyQuantizer,
+        mimi_transformer::{
+            MimiProjectedTransformer, MimiProjectedTransformerConfig, MimiTransformerConfig,
+            MimiTransformerState, ProjectedOutput,
+        },
+        resample::{
+            ConvDownsample1d, ConvDownsample1dState, ConvTrUpsample1d, ConvTrUpsample1dState,
+        },
+        seanet::{SeanetDecoder, SeanetEncoder, SeanetLayer, SeanetResnetBlock, SeanetState},
+        streaming_conv::{
+            PaddingMode, StreamingConv1dOp, StreamingConvConfig, StreamingConvTranspose1dOp,
+        },
+    },
+    weights::TensorData as WeightTensor,
 };
-use crate::modules::resample::{
-    ConvDownsample1d, ConvDownsample1dState, ConvTrUpsample1d, ConvTrUpsample1dState,
+use burn::{
+    module::Param,
+    tensor::{backend::Backend, Tensor, TensorData as BurnTensorData},
 };
-use crate::modules::seanet::{
-    SeanetDecoder, SeanetEncoder, SeanetLayer, SeanetResnetBlock, SeanetState,
-};
-use crate::modules::streaming_conv::{
-    PaddingMode, StreamingConv1dOp, StreamingConvConfig, StreamingConvTranspose1dOp,
-};
-use burn::module::Param;
-use burn::tensor::backend::Backend;
-use burn::tensor::{Tensor, TensorData as BurnTensorData};
 use safetensors::Dtype;
 use std::collections::HashMap;
 
+/// Streaming state for Mimi encoder/decoder and transformers.
 #[derive(Debug, Clone)]
 pub struct MimiState<B: Backend> {
+    /// Encoder SEANet state.
     pub encoder: SeanetState<B>,
+    /// Decoder SEANet state.
     pub decoder: SeanetState<B>,
+    /// Encoder transformer state.
     pub encoder_transformer: MimiTransformerState<B>,
+    /// Decoder transformer state.
     pub decoder_transformer: MimiTransformerState<B>,
+    /// Optional downsample state (if frame rates differ).
     pub downsample: Option<ConvDownsample1dState<B>>,
+    /// Optional upsample state (if frame rates differ).
     pub upsample: Option<ConvTrUpsample1dState<B>>,
 }
 
+/// Mimi codec model (SEANet + transformer + quantizer).
 #[derive(Debug, Clone)]
 pub struct MimiModel<B: Backend> {
     pub encoder: SeanetEncoder<B>,
@@ -46,6 +64,7 @@ pub struct MimiModel<B: Backend> {
 
 impl<B: Backend> MimiModel<B> {
     #[allow(clippy::too_many_arguments)]
+    /// Construct a Mimi model from pre-built components.
     pub fn new(
         encoder: SeanetEncoder<B>,
         decoder: SeanetDecoder<B>,
@@ -82,6 +101,7 @@ impl<B: Backend> MimiModel<B> {
         }
     }
 
+    /// Number of audio samples produced per latent frame.
     pub fn frame_size(&self) -> usize {
         (self.sample_rate as f32 / self.frame_rate) as usize
     }
@@ -95,11 +115,12 @@ impl<B: Backend> MimiModel<B> {
             .unwrap_or(1)
     }
 
+    /// Build a Mimi model from config (without loading weights).
     pub fn from_config(config: &MimiConfig, device: &B::Device) -> Self {
         let encoder = build_seanet_encoder(&config.seanet, device);
         let decoder = build_seanet_decoder(&config.seanet, device);
 
-        let transformer = crate::modules::mimi_transformer::MimiTransformerConfig {
+        let transformer = MimiTransformerConfig {
             d_model: config.transformer.d_model as usize,
             num_heads: config.transformer.num_heads as usize,
             num_layers: config.transformer.num_layers as usize,
@@ -108,7 +129,7 @@ impl<B: Backend> MimiModel<B> {
             max_period: config.transformer.max_period,
             dim_feedforward: config.transformer.dim_feedforward as usize,
         };
-        let projected = crate::modules::mimi_transformer::MimiProjectedTransformerConfig {
+        let projected = MimiProjectedTransformerConfig {
             input_dim: config.transformer.input_dimension as usize,
             output_dims: config
                 .transformer
@@ -176,6 +197,7 @@ impl<B: Backend> MimiModel<B> {
         )
     }
 
+    /// Initialize streaming state for encoder, decoder, and transformers.
     pub fn init_state(
         &self,
         batch_size: usize,
@@ -205,6 +227,7 @@ impl<B: Backend> MimiModel<B> {
         }
     }
 
+    /// Encode raw audio into latent frames.
     pub fn encode_to_latent(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
         let [batch, channels, length] = input.dims();
         assert_eq!(channels, self.channels);
@@ -238,6 +261,7 @@ impl<B: Backend> MimiModel<B> {
         self.to_framerate(emb, downsample_state.as_mut())
     }
 
+    /// Decode latent frames into audio samples.
     pub fn decode_from_latent(
         &self,
         latent: Tensor<B, 3>,
@@ -253,6 +277,7 @@ impl<B: Backend> MimiModel<B> {
             .expect("seanet decoder")
     }
 
+    /// Advance transformer position state by `increment` steps.
     pub fn increment_step(&self, state: &mut MimiState<B>, increment: usize) {
         self.encoder_transformer
             .increment_step(&mut state.encoder_transformer, increment);
@@ -260,6 +285,7 @@ impl<B: Backend> MimiModel<B> {
             .increment_step(&mut state.decoder_transformer, increment);
     }
 
+    /// Convert encoder output to the configured frame rate.
     fn to_framerate(
         &self,
         input: Tensor<B, 3>,
@@ -271,6 +297,7 @@ impl<B: Backend> MimiModel<B> {
         }
     }
 
+    /// Convert latent frames back to the encoder's native frame rate.
     fn to_encoder_framerate(
         &self,
         input: Tensor<B, 3>,
@@ -282,9 +309,10 @@ impl<B: Backend> MimiModel<B> {
         }
     }
 
+    /// Load Mimi weights from a state dict.
     pub fn load_state_dict(
         &mut self,
-        state: &HashMap<String, crate::weights::TensorData>,
+        state: &HashMap<String, WeightTensor>,
         device: &B::Device,
     ) -> anyhow::Result<()> {
         for (name, tensor) in state {
@@ -335,6 +363,7 @@ impl<B: Backend> MimiModel<B> {
     }
 }
 
+/// Map padding mode strings to streaming convolution modes.
 fn pad_mode_from_str(value: &str) -> PaddingMode {
     match value {
         "replicate" | "reflect" => PaddingMode::Replicate,
@@ -342,6 +371,7 @@ fn pad_mode_from_str(value: &str) -> PaddingMode {
     }
 }
 
+/// Build a streaming convolution config from SEANet params.
 fn conv_config(
     kernel_size: usize,
     stride: usize,
@@ -358,6 +388,7 @@ fn conv_config(
     }
 }
 
+/// Create a 1D convolution op with zero-initialized parameters.
 fn conv1d<B: Backend>(
     in_channels: usize,
     out_channels: usize,
@@ -376,6 +407,7 @@ fn conv1d<B: Backend>(
     )
 }
 
+/// Create a transposed 1D convolution op with zero-initialized parameters.
 fn conv_transpose<B: Backend>(
     in_channels: usize,
     out_channels: usize,
@@ -397,6 +429,7 @@ fn conv_transpose<B: Backend>(
     StreamingConvTranspose1dOp::new(config, weight, Some(bias))
 }
 
+/// Build the SEANet encoder stack from config.
 fn build_seanet_encoder<B: Backend>(config: &SeanetConfig, device: &B::Device) -> SeanetEncoder<B> {
     let pad_mode = pad_mode_from_str(&config.pad_mode);
     let mut layers = Vec::new();
@@ -465,6 +498,7 @@ fn build_seanet_encoder<B: Backend>(config: &SeanetConfig, device: &B::Device) -
     SeanetEncoder::new(layers)
 }
 
+/// Build the SEANet decoder stack from config.
 fn build_seanet_decoder<B: Backend>(config: &SeanetConfig, device: &B::Device) -> SeanetDecoder<B> {
     let pad_mode = pad_mode_from_str(&config.pad_mode);
     let ratios: Vec<usize> = config.ratios.iter().map(|v| *v as usize).collect();
@@ -531,7 +565,8 @@ fn build_seanet_decoder<B: Backend>(config: &SeanetConfig, device: &B::Device) -
     SeanetDecoder::new(layers)
 }
 
-fn tensor_f32(tensor: &crate::weights::TensorData) -> anyhow::Result<Vec<f32>> {
+/// Decode raw tensor bytes into f32 values for supported dtypes.
+fn tensor_f32(tensor: &WeightTensor) -> anyhow::Result<Vec<f32>> {
     match tensor.dtype {
         Dtype::F32 => {
             let mut values = Vec::with_capacity(tensor.data.len() / 4);
@@ -578,8 +613,9 @@ mod tests {
     }
 }
 
+/// Convert a 1D tensor payload into a Burn tensor.
 fn tensor1_from_data<B: Backend>(
-    tensor: &crate::weights::TensorData,
+    tensor: &WeightTensor,
     device: &B::Device,
 ) -> anyhow::Result<Tensor<B, 1>> {
     let shape: [usize; 1] = tensor
@@ -594,8 +630,9 @@ fn tensor1_from_data<B: Backend>(
     ))
 }
 
+/// Convert a 2D tensor payload into a Burn tensor.
 fn tensor2_from_data<B: Backend>(
-    tensor: &crate::weights::TensorData,
+    tensor: &WeightTensor,
     device: &B::Device,
 ) -> anyhow::Result<Tensor<B, 2>> {
     let shape: [usize; 2] = tensor
@@ -610,8 +647,9 @@ fn tensor2_from_data<B: Backend>(
     ))
 }
 
+/// Convert a 3D tensor payload into a Burn tensor.
 fn tensor3_from_data<B: Backend>(
-    tensor: &crate::weights::TensorData,
+    tensor: &WeightTensor,
     device: &B::Device,
 ) -> anyhow::Result<Tensor<B, 3>> {
     let shape: [usize; 3] = tensor
@@ -626,10 +664,11 @@ fn tensor3_from_data<B: Backend>(
     ))
 }
 
+/// Apply weights targeting SEANet layers.
 fn apply_seanet_weight<B: Backend>(
     layers: &mut [SeanetLayer<B>],
     rest: &str,
-    tensor: &crate::weights::TensorData,
+    tensor: &WeightTensor,
     device: &B::Device,
 ) -> anyhow::Result<()> {
     let mut parts = rest.split('.');
@@ -675,10 +714,11 @@ fn apply_seanet_weight<B: Backend>(
     Ok(())
 }
 
+/// Apply weights to the projected transformer stack.
 fn apply_projected_transformer_weight<B: Backend>(
     transformer: &mut MimiProjectedTransformer<B>,
     rest: &str,
-    tensor: &crate::weights::TensorData,
+    tensor: &WeightTensor,
     device: &B::Device,
 ) -> anyhow::Result<()> {
     if rest == "input_proj.weight" {
@@ -758,9 +798,10 @@ fn apply_projected_transformer_weight<B: Backend>(
     Ok(())
 }
 
+/// Assign a 2D weight tensor to a linear layer (with transpose).
 fn set_linear_weight<B: Backend>(
     linear: &mut burn_nn::Linear<B>,
-    tensor: &crate::weights::TensorData,
+    tensor: &WeightTensor,
     device: &B::Device,
 ) -> anyhow::Result<()> {
     let weight = tensor2_from_data(tensor, device)?;
@@ -768,10 +809,11 @@ fn set_linear_weight<B: Backend>(
     Ok(())
 }
 
+/// Apply weights to the optional downsample convolution.
 fn apply_downsample_weight<B: Backend>(
     downsample: &mut ConvDownsample1d<B>,
     rest: &str,
-    tensor: &crate::weights::TensorData,
+    tensor: &WeightTensor,
     device: &B::Device,
 ) -> anyhow::Result<()> {
     if rest == "conv.weight" {
@@ -780,10 +822,11 @@ fn apply_downsample_weight<B: Backend>(
     Ok(())
 }
 
+/// Apply weights to the optional upsample convolution.
 fn apply_upsample_weight<B: Backend>(
     upsample: &mut ConvTrUpsample1d<B>,
     rest: &str,
-    tensor: &crate::weights::TensorData,
+    tensor: &WeightTensor,
     device: &B::Device,
 ) -> anyhow::Result<()> {
     if rest == "conv.weight" {

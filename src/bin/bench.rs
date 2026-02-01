@@ -1,4 +1,6 @@
-// Benchmark binary - only used when a backend feature is enabled.
+//! Benchmark binary for comparing backend performance.
+//!
+//! This binary is only built when a backend feature is enabled.
 #![allow(dead_code, unused_variables)]
 
 use anyhow::Result;
@@ -9,13 +11,18 @@ use guth::config::load_config;
 use guth::model::tts::TtsModel;
 use std::time::Instant;
 
+/// Parsed benchmark arguments.
 #[derive(Debug, Clone, Copy)]
 struct BenchArgs {
+    /// Number of iterations for batch mode.
     iters: usize,
+    /// Maximum latent frames to generate.
     max_gen_len: usize,
+    /// Whether to run in streaming mode.
     stream: bool,
 }
 
+/// Parse CLI args for the benchmark runner.
 fn parse_args() -> (String, BenchArgs) {
     let mut config_path = "tests/fixtures/tts_integration_config.yaml".to_string();
     let mut iters = 3usize;
@@ -57,6 +64,7 @@ fn parse_args() -> (String, BenchArgs) {
     )
 }
 
+/// Run the benchmark for a specific backend.
 fn run_bench<B: Backend>(
     name: &str,
     device: &B::Device,
@@ -116,6 +124,7 @@ fn run_bench<B: Backend>(
     Ok(())
 }
 
+/// Entry point for the benchmark binary.
 fn main() -> Result<()> {
     let (config_path, args) = parse_args();
 

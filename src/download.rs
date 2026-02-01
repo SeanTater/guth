@@ -108,6 +108,7 @@ fn url_to_cache_filename(url: &str) -> String {
         .collect()
 }
 
+/// Parse `owner/repo/path@rev` into components for HuggingFace downloads.
 fn parse_hf_path(path: &str) -> Result<(String, String, Option<String>)> {
     let mut parts = path.split('/').collect::<Vec<_>>();
     if parts.len() < 3 {

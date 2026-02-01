@@ -1,0 +1,284 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cross.toml'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (build only, no release)'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Strip binary
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            strip target/${{ matrix.target }}/release/guth
+          else
+            # For aarch64, use the cross container's strip
+            docker run --rm -v "$PWD:/work" -w /work \
+              ghcr.io/cross-rs/${{ matrix.target }}:main \
+              aarch64-linux-gnu-strip target/${{ matrix.target }}/release/guth
+          fi
+
+      - name: Create archive
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czvf ../../../guth-${{ matrix.target }}.tar.gz guth
+
+      - name: Generate checksum
+        run: sha256sum guth-${{ matrix.target }}.tar.gz > guth-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: guth-${{ matrix.target }}
+          path: |
+            guth-${{ matrix.target }}.tar.gz
+            guth-${{ matrix.target }}.tar.gz.sha256
+
+  build-macos:
+    strategy:
+      matrix:
+        include:
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip binary
+        run: strip target/${{ matrix.target }}/release/guth
+
+      - name: Create archive
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czvf ../../../guth-${{ matrix.target }}.tar.gz guth
+
+      - name: Generate checksum
+        run: shasum -a 256 guth-${{ matrix.target }}.tar.gz > guth-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: guth-${{ matrix.target }}
+          path: |
+            guth-${{ matrix.target }}.tar.gz
+            guth-${{ matrix.target }}.tar.gz.sha256
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Create archive
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/x86_64-pc-windows-msvc/release/guth.exe -DestinationPath guth-x86_64-pc-windows-msvc.zip
+
+      - name: Generate checksum
+        shell: pwsh
+        run: |
+          $hash = Get-FileHash -Algorithm SHA256 guth-x86_64-pc-windows-msvc.zip
+          "$($hash.Hash.ToLower())  guth-x86_64-pc-windows-msvc.zip" | Out-File -Encoding ASCII guth-x86_64-pc-windows-msvc.zip.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: guth-x86_64-pc-windows-msvc
+          path: |
+            guth-x86_64-pc-windows-msvc.zip
+            guth-x86_64-pc-windows-msvc.zip.sha256
+
+  # Integration tests - verify archives extract and binaries run
+  test-linux-x86_64:
+    needs: build-linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: guth-x86_64-unknown-linux-gnu
+          path: .
+
+      - name: Verify checksum
+        run: sha256sum -c guth-x86_64-unknown-linux-gnu.tar.gz.sha256
+
+      - name: Extract and test
+        run: |
+          tar -xzf guth-x86_64-unknown-linux-gnu.tar.gz
+          ./guth --help
+          # Verify it's a valid ELF binary
+          file guth | grep -q "ELF 64-bit"
+
+  test-linux-aarch64:
+    needs: build-linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: guth-aarch64-unknown-linux-gnu
+          path: .
+
+      - name: Verify checksum
+        run: sha256sum -c guth-aarch64-unknown-linux-gnu.tar.gz.sha256
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Extract and test with QEMU
+        run: |
+          tar -xzf guth-aarch64-unknown-linux-gnu.tar.gz
+          # Verify it's an ARM64 binary
+          file guth | grep -q "aarch64"
+          # Test execution via QEMU
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD:/app" -w /app \
+            debian:bookworm-slim \
+            ./guth --help
+
+  test-macos-x86_64:
+    needs: build-macos
+    runs-on: macos-13
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: guth-x86_64-apple-darwin
+          path: .
+
+      - name: Verify checksum
+        run: shasum -a 256 -c guth-x86_64-apple-darwin.tar.gz.sha256
+
+      - name: Extract and test
+        run: |
+          tar -xzf guth-x86_64-apple-darwin.tar.gz
+          ./guth --help
+          file guth | grep -q "Mach-O 64-bit executable x86_64"
+
+  test-macos-aarch64:
+    needs: build-macos
+    runs-on: macos-14
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: guth-aarch64-apple-darwin
+          path: .
+
+      - name: Verify checksum
+        run: shasum -a 256 -c guth-aarch64-apple-darwin.tar.gz.sha256
+
+      - name: Extract and test
+        run: |
+          tar -xzf guth-aarch64-apple-darwin.tar.gz
+          ./guth --help
+          file guth | grep -q "Mach-O 64-bit executable arm64"
+
+  test-windows:
+    needs: build-windows
+    runs-on: windows-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: guth-x86_64-pc-windows-msvc
+          path: .
+
+      - name: Verify checksum
+        shell: pwsh
+        run: |
+          $expected = (Get-Content guth-x86_64-pc-windows-msvc.zip.sha256 -Raw).Trim().Split()[0]
+          $actual = (Get-FileHash -Algorithm SHA256 guth-x86_64-pc-windows-msvc.zip).Hash.ToLower()
+          if ($expected -ne $actual) {
+            Write-Error "Checksum mismatch: expected $expected, got $actual"
+            exit 1
+          }
+
+      - name: Extract and test
+        shell: pwsh
+        run: |
+          Expand-Archive -Path guth-x86_64-pc-windows-msvc.zip -DestinationPath .
+          .\guth.exe --help
+
+  release:
+    needs: [test-linux-x86_64, test-linux-aarch64, test-macos-x86_64, test-macos-aarch64, test-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') && !inputs.dry_run
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

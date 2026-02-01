@@ -1,13 +1,22 @@
+//! SafeTensors weight loading and name mapping utilities.
+//!
+//! These helpers translate between Python checkpoint naming conventions and the
+//! Rust module layout used by this crate.
+
 use anyhow::Result;
 use safetensors::{Dtype, SafeTensors};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+/// Raw tensor payload extracted from a SafeTensors file.
 #[derive(Debug, Clone)]
 pub struct TensorData {
+    /// Scalar dtype in the file.
     pub dtype: Dtype,
+    /// Shape as a list of dimensions.
     pub shape: Vec<usize>,
+    /// Raw byte buffer in row-major order.
     pub data: Vec<u8>,
 }
 
@@ -22,6 +31,7 @@ impl TensorData {
     }
 }
 
+/// Load a FlowLM checkpoint and map names into Rust module paths.
 pub fn load_flow_lm_state_dict(path: impl AsRef<Path>) -> Result<HashMap<String, TensorData>> {
     let path = path.as_ref();
     let bytes = fs::read(path)?;
@@ -29,29 +39,17 @@ pub fn load_flow_lm_state_dict(path: impl AsRef<Path>) -> Result<HashMap<String,
     let mut state = HashMap::new();
 
     for name in tensors.names() {
-        let name = name.strip_prefix("flow_lm.").unwrap_or(name);
-        if name.starts_with("flow.w_s_t.")
-            || name == "condition_provider.conditioners.transcript_in_segment.learnt_padding"
-            || name == "condition_provider.conditioners.speaker_wavs.learnt_padding"
-        {
-            continue;
+        let rest = name.strip_prefix("flow_lm.").unwrap_or(name);
+        if let Some(mapped) = map_flow_lm_name(rest) {
+            let tensor = tensors.tensor(name)?;
+            state.insert(mapped, TensorData::from_safetensor(tensor));
         }
-
-        let mut new_name = name.to_string();
-        if name == "condition_provider.conditioners.transcript_in_segment.embed.weight" {
-            new_name = "conditioner.embed.weight".to_string();
-        }
-        if name == "condition_provider.conditioners.speaker_wavs.output_proj.weight" {
-            new_name = "speaker_proj_weight".to_string();
-        }
-
-        let tensor = tensors.tensor(name)?;
-        state.insert(new_name, TensorData::from_safetensor(tensor));
     }
 
     Ok(state)
 }
 
+/// Load a Mimi checkpoint and map names into Rust module paths.
 pub fn load_mimi_state_dict(path: impl AsRef<Path>) -> Result<HashMap<String, TensorData>> {
     let path = path.as_ref();
     let bytes = fs::read(path)?;
@@ -72,13 +70,18 @@ pub fn load_mimi_state_dict(path: impl AsRef<Path>) -> Result<HashMap<String, Te
     Ok(state)
 }
 
+/// Combined state dictionary for the full TTS model.
 #[derive(Debug)]
 pub struct TtsStateDict {
+    /// FlowLM tensors keyed by Rust module path.
     pub flow_lm: HashMap<String, TensorData>,
+    /// Mimi tensors keyed by Rust module path.
     pub mimi: HashMap<String, TensorData>,
+    /// Optional speaker projection weights (voice conditioning).
     pub speaker_proj_weight: Option<TensorData>,
 }
 
+/// Load a combined TTS checkpoint with FlowLM + Mimi weights.
 pub fn load_tts_state_dict(path: impl AsRef<Path>) -> Result<TtsStateDict> {
     let path = path.as_ref();
     let bytes = fs::read(path)?;
@@ -95,26 +98,14 @@ pub fn load_tts_state_dict(path: impl AsRef<Path>) -> Result<TtsStateDict> {
         }
 
         if let Some(rest) = name.strip_prefix("flow_lm.") {
-            if rest.starts_with("flow.w_s_t.")
-                || rest == "condition_provider.conditioners.transcript_in_segment.learnt_padding"
-                || rest == "condition_provider.conditioners.speaker_wavs.learnt_padding"
-            {
-                continue;
+            if let Some(mapped) = map_flow_lm_name(rest) {
+                let tensor = tensors.tensor(name)?;
+                let tensor_data = TensorData::from_safetensor(tensor);
+                if mapped == "speaker_proj_weight" {
+                    speaker_proj_weight = Some(tensor_data.clone());
+                }
+                flow_lm.insert(mapped, tensor_data);
             }
-
-            let mut new_name = rest.to_string();
-            if rest == "condition_provider.conditioners.transcript_in_segment.embed.weight" {
-                new_name = "conditioner.embed.weight".to_string();
-            }
-            if rest == "condition_provider.conditioners.speaker_wavs.output_proj.weight" {
-                new_name = "speaker_proj_weight".to_string();
-            }
-            let tensor = tensors.tensor(name)?;
-            let tensor_data = TensorData::from_safetensor(tensor);
-            if rest == "speaker_proj_weight" || new_name == "speaker_proj_weight" {
-                speaker_proj_weight = Some(tensor_data.clone());
-            }
-            flow_lm.insert(new_name, tensor_data);
             continue;
         }
 
@@ -133,51 +124,105 @@ pub fn load_tts_state_dict(path: impl AsRef<Path>) -> Result<TtsStateDict> {
     })
 }
 
-fn map_mimi_name(name: &str) -> Option<String> {
-    let name = name.strip_prefix("model.").unwrap_or(name);
-    if name.starts_with("quantizer.vq.") || name == "quantizer.logvar_proj.weight" {
+/// Map FlowLM checkpoint tensor names into Rust module paths.
+fn map_flow_lm_name(name: &str) -> Option<String> {
+    // Mapping rules are intentionally explicit to make debugging weight loading easy.
+    const FLOW_SKIP_EXACT: &[&str] = &[
+        "condition_provider.conditioners.transcript_in_segment.learnt_padding",
+        "condition_provider.conditioners.speaker_wavs.learnt_padding",
+    ];
+    const FLOW_SKIP_PREFIXES: &[&str] = &["flow.w_s_t."];
+    const FLOW_RENAME_EXACT: &[(&str, &str)] = &[
+        (
+            "condition_provider.conditioners.transcript_in_segment.embed.weight",
+            "conditioner.embed.weight",
+        ),
+        (
+            "condition_provider.conditioners.speaker_wavs.output_proj.weight",
+            "speaker_proj_weight",
+        ),
+    ];
+
+    if FLOW_SKIP_EXACT.iter().any(|skip| *skip == name)
+        || FLOW_SKIP_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+    {
         return None;
     }
-    if name == "quantizer.output_proj.weight" {
-        return Some("quantizer.weight".to_string());
+
+    if let Some(mapped) = map_exact(name, FLOW_RENAME_EXACT) {
+        return Some(mapped);
     }
+
+    Some(name.to_string())
+}
+
+/// Map Mimi checkpoint tensor names into Rust module paths.
+fn map_mimi_name(name: &str) -> Option<String> {
+    // Mapping rules are intentionally explicit to make debugging weight loading easy.
+    const MIMI_SKIP_EXACT: &[&str] = &["quantizer.logvar_proj.weight"];
+    const MIMI_SKIP_PREFIXES: &[&str] = &["quantizer.vq."];
+    const MIMI_RENAME_EXACT: &[(&str, &str)] =
+        &[("quantizer.output_proj.weight", "quantizer.weight")];
+    const MIMI_PREFIX_MAP: &[(&str, &str)] = &[
+        ("encoder_transformer.transformer.", "encoder_transformer."),
+        ("decoder_transformer.transformer.", "decoder_transformer."),
+        // Original: downsample.conv.conv.weight -> Target: downsample.conv.weight
+        ("downsample.conv.conv.", "downsample.conv."),
+        // Original: upsample.convtr.convtr.weight -> Target: upsample.conv.weight
+        ("upsample.convtr.convtr.", "upsample.conv."),
+        // Fallback: downsample.conv.weight -> downsample.conv.weight (if no double prefix)
+        ("downsample.conv.", "downsample.conv."),
+        // Fallback: upsample.convtr.weight -> upsample.conv.weight (if no double prefix)
+        ("upsample.convtr.", "upsample.conv."),
+    ];
+
+    let name = name.strip_prefix("model.").unwrap_or(name);
+
+    if MIMI_SKIP_EXACT.iter().any(|skip| *skip == name)
+        || MIMI_SKIP_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+    {
+        return None;
+    }
+
+    if let Some(mapped) = map_exact(name, MIMI_RENAME_EXACT) {
+        return Some(mapped);
+    }
+
     if let Some(rest) = name.strip_prefix("encoder.model.") {
         return map_seanet_layer("encoder", rest);
     }
     if let Some(rest) = name.strip_prefix("decoder.model.") {
         return map_seanet_layer("decoder", rest);
     }
-    if let Some(rest) = name.strip_prefix("encoder_transformer.transformer.") {
-        return Some(format!("encoder_transformer.{rest}"));
+
+    if let Some(mapped) = map_prefix(name, MIMI_PREFIX_MAP) {
+        return Some(mapped);
     }
-    if let Some(rest) = name.strip_prefix("decoder_transformer.transformer.") {
-        return Some(format!("decoder_transformer.{rest}"));
-    }
-    if let Some(rest) = name.strip_prefix("encoder_transformer.") {
-        return Some(format!("encoder_transformer.{rest}"));
-    }
-    if let Some(rest) = name.strip_prefix("decoder_transformer.") {
-        return Some(format!("decoder_transformer.{rest}"));
-    }
-    // Original: downsample.conv.conv.weight -> Target: downsample.conv.weight
-    if let Some(rest) = name.strip_prefix("downsample.conv.conv.") {
-        return Some(format!("downsample.conv.{rest}"));
-    }
-    // Original: upsample.convtr.convtr.weight -> Target: upsample.conv.weight
-    if let Some(rest) = name.strip_prefix("upsample.convtr.convtr.") {
-        return Some(format!("upsample.conv.{rest}"));
-    }
-    // Fallback: downsample.conv.weight -> downsample.conv.weight (if no double prefix)
-    if let Some(rest) = name.strip_prefix("downsample.conv.") {
-        return Some(format!("downsample.conv.{rest}"));
-    }
-    // Fallback: upsample.convtr.weight -> upsample.conv.weight (if no double prefix)
-    if let Some(rest) = name.strip_prefix("upsample.convtr.") {
-        return Some(format!("upsample.conv.{rest}"));
-    }
+
     Some(name.to_string())
 }
 
+/// Apply exact-match rename rules.
+fn map_exact(name: &str, rules: &[(&str, &str)]) -> Option<String> {
+    for (from, to) in rules {
+        if name == *from {
+            return Some((*to).to_string());
+        }
+    }
+    None
+}
+
+/// Apply prefix-based rename rules.
+fn map_prefix(name: &str, rules: &[(&str, &str)]) -> Option<String> {
+    for (prefix, target) in rules {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return Some(format!("{target}{rest}"));
+        }
+    }
+    None
+}
+
+/// Map a SEANet layer name into the Rust `SeanetLayer` index format.
 fn map_seanet_layer(prefix: &str, rest: &str) -> Option<String> {
     let mut parts = rest.split('.');
     let layer_idx = parts.next()?;
@@ -213,6 +258,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
 
+    /// Write a temporary SafeTensors file from named views.
     fn write_safetensors(path: &Path, tensors: HashMap<String, TensorView<'_>>) {
         let bytes = serialize(&tensors, &None).expect("serialize safetensors");
         fs::write(path, bytes).expect("write safetensors");

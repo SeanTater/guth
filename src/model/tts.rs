@@ -1,11 +1,24 @@
-use crate::config::Config;
-use crate::download::download_if_necessary;
-use crate::model::flow_lm::{FlowLmModel, FlowLmState};
-use crate::model::mimi::{MimiModel, MimiState};
-use crate::weights::{load_flow_lm_state_dict, load_mimi_state_dict, load_tts_state_dict};
-use burn::tensor::backend::Backend;
-use burn::tensor::module::linear;
-use burn::tensor::{Bool, ElementConversion, Int, Tensor};
+//! End-to-end text-to-speech model orchestration.
+//!
+//! This module wires FlowLM (text-to-latent) and Mimi (latent-to-audio) into a
+//! single interface that supports batch and streaming generation.
+
+use crate::{
+    config::Config,
+    download::download_if_necessary,
+    model::{
+        flow_lm::{FlowLmModel, FlowLmState},
+        mimi::{MimiModel, MimiState},
+    },
+    weights::{
+        load_flow_lm_state_dict, load_mimi_state_dict, load_tts_state_dict,
+        TensorData as WeightTensor,
+    },
+};
+use burn::tensor::{
+    backend::Backend, module::linear, Bool, ElementConversion, Int, Tensor,
+    TensorData as BurnTensorData,
+};
 use std::sync::mpsc::{self, Receiver};
 
 /// State container for streaming TTS generation.
@@ -379,6 +392,7 @@ impl<B: Backend + 'static> TtsModel<B> {
         rx
     }
 
+    /// Condition the model state on a reference audio prompt (voice cloning).
     pub fn condition_on_audio(
         &self,
         audio_prompt: Tensor<B, 3>,
@@ -406,6 +420,7 @@ impl<B: Backend + 'static> TtsModel<B> {
         Ok(())
     }
 
+    /// Run a single FlowLM step and update the stream state.
     fn run_flow_lm_and_increment(
         &self,
         state: &mut TtsState<B>,
@@ -466,6 +481,7 @@ impl<B: Backend + 'static> TtsModel<B> {
         Ok((latent, is_eos))
     }
 
+    /// Decode a single latent frame into audio samples.
     fn decode_latent_step(&self, latent: Tensor<B, 3>, state: &mut MimiState<B>) -> Tensor<B, 3> {
         let emb_mean = self
             .flow_lm
@@ -488,8 +504,9 @@ impl<B: Backend + 'static> TtsModel<B> {
     }
 }
 
+/// Convert a 2D tensor payload into a Burn tensor.
 fn tensor2_from_data<B: Backend>(
-    tensor: &crate::weights::TensorData,
+    tensor: &WeightTensor,
     device: &B::Device,
 ) -> anyhow::Result<Tensor<B, 2>> {
     let shape: [usize; 2] = tensor
@@ -515,11 +532,12 @@ fn tensor2_from_data<B: Backend>(
         _ => anyhow::bail!("Unsupported dtype {:?}", tensor.dtype),
     }
     Ok(Tensor::from_data(
-        burn::tensor::TensorData::new(values, shape),
+        BurnTensorData::new(values, shape),
         device,
     ))
 }
 
+/// Create an int tensor with shape `[batch, len]`, allowing zero length.
 fn empty_tensor2_int<B: Backend>(
     batch: usize,
     len: usize,
@@ -527,13 +545,14 @@ fn empty_tensor2_int<B: Backend>(
 ) -> Tensor<B, 2, Int> {
     if len == 0 {
         let data: Vec<i64> = Vec::new();
-        let td = burn::tensor::TensorData::new(data, [batch, len]);
+        let td = BurnTensorData::new(data, [batch, len]);
         Tensor::from_data(td, device)
     } else {
         Tensor::<B, 2, Int>::zeros([batch, len], device)
     }
 }
 
+/// Create a float tensor with shape `[batch, seq, dim]`, allowing zero length.
 fn empty_tensor3<B: Backend>(
     batch: usize,
     seq: usize,
@@ -542,7 +561,7 @@ fn empty_tensor3<B: Backend>(
 ) -> Tensor<B, 3> {
     if seq == 0 {
         let data: Vec<f32> = Vec::new();
-        let td = burn::tensor::TensorData::new(data, [batch, seq, dim]);
+        let td = BurnTensorData::new(data, [batch, seq, dim]);
         Tensor::from_data(td, device)
     } else {
         Tensor::<B, 3>::zeros([batch, seq, dim], device)

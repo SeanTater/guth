@@ -1,13 +1,20 @@
+//! Audio file reading and writing helpers.
+//!
+//! This module focuses on simple WAV/OGG I/O for the CLI. The model expects
+//! floating point samples in `[-1.0, 1.0]` and a known sample rate.
+
 use anyhow::Result;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
 
+/// Stateless helper for loading and saving audio files.
 #[derive(Debug, Default)]
 pub struct WavIo;
 
 impl WavIo {
+    /// Read audio from WAV or OGG, returning per-channel samples and sample rate.
     pub fn read_audio(path: impl AsRef<Path>) -> Result<(Vec<Vec<f32>>, u32)> {
         let path = path.as_ref();
         match path
@@ -22,6 +29,7 @@ impl WavIo {
         }
     }
 
+    /// Read a WAV file into per-channel floating point samples.
     pub fn read_wav(path: impl AsRef<Path>) -> Result<(Vec<Vec<f32>>, u32)> {
         let mut reader = WavReader::open(path)?;
         let spec = reader.spec();
@@ -48,6 +56,7 @@ impl WavIo {
         Ok((samples, sample_rate))
     }
 
+    /// Read an OGG/Vorbis file into per-channel floating point samples.
     pub fn read_ogg(path: impl AsRef<Path>) -> Result<(Vec<Vec<f32>>, u32)> {
         let file = File::open(path)?;
         let mut reader = lewton::inside_ogg::OggStreamReader::new(BufReader::new(file))?;
@@ -65,6 +74,7 @@ impl WavIo {
         Ok((samples, sample_rate))
     }
 
+    /// Write per-channel floating point samples to a 16-bit PCM WAV file.
     pub fn write_wav(path: impl AsRef<Path>, samples: &[Vec<f32>], sample_rate: u32) -> Result<()> {
         if samples.is_empty() {
             anyhow::bail!("No audio channels provided");
@@ -98,12 +108,14 @@ impl WavIo {
     }
 }
 
+/// Streaming WAV writer for chunked audio generation.
 pub struct StreamingWavWriter {
     writer: WavWriter<BufWriter<File>>,
     channels: usize,
 }
 
 impl StreamingWavWriter {
+    /// Create a new streaming WAV writer with the given format.
     pub fn create(path: impl AsRef<Path>, sample_rate: u32, channels: usize) -> Result<Self> {
         let spec = WavSpec {
             channels: channels as u16,
@@ -115,6 +127,7 @@ impl StreamingWavWriter {
         Ok(Self { writer, channels })
     }
 
+    /// Append a chunk of interleaved audio samples to the WAV file.
     pub fn write_chunk(&mut self, samples: &[Vec<f32>]) -> Result<()> {
         if samples.len() != self.channels {
             anyhow::bail!("Streaming WAV chunk has wrong channel count");
@@ -135,6 +148,7 @@ impl StreamingWavWriter {
         Ok(())
     }
 
+    /// Finalize the WAV file and flush headers to disk.
     pub fn finalize(self) -> Result<()> {
         self.writer.finalize()?;
         Ok(())

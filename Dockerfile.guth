@@ -1,0 +1,34 @@
+# Build stage
+# Note: burn 0.20.1 requires Rust 1.89+
+FROM rust:1.92-bookworm AS builder
+
+RUN apt-get update && apt-get install -y cmake g++ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Dependency caching layer - copy only files needed for dependency resolution
+COPY Cargo.toml Cargo.lock ./
+
+# Create dummy source files to build dependencies
+RUN mkdir src && \
+    echo "fn main() {}" > src/main.rs && \
+    echo "" > src/lib.rs
+
+# Build dependencies (this layer is cached unless Cargo.toml/Cargo.lock change)
+RUN cargo build --release && rm -rf src
+
+# Copy actual source code
+COPY src ./src
+COPY README.md ./
+
+# Touch source files to invalidate the dummy build, then build real binary
+RUN touch src/main.rs src/lib.rs && \
+    cargo build --release && \
+    strip target/release/guth
+
+# Runtime stage - minimal distroless image
+FROM gcr.io/distroless/cc-debian12:nonroot
+
+COPY --from=builder /build/target/release/guth /usr/local/bin/guth
+
+ENTRYPOINT ["/usr/local/bin/guth"]
