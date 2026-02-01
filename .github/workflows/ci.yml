@@ -14,21 +14,19 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: guth
+
+      - name: Cargo fmt check
+        run: cargo fmt -- --check
 
       - name: Cargo check
-        working-directory: guth
         run: cargo check
 
       - name: Cargo clippy
-        working-directory: guth
         run: cargo clippy -- -D warnings
 
       - name: Cargo test
-        working-directory: guth
         run: cargo test
