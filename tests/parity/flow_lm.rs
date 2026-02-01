@@ -1,10 +1,8 @@
-mod common;
-
 use burn::tensor::{Tensor, Tolerance};
 use burn_ndarray::NdArrayDevice;
 use serde::Deserialize;
 
-use common::{read_fixture, tensor2, tensor2_int, tensor3, tensor3_bool, TestBackend};
+use crate::common::{read_fixture, tensor2, tensor2_int, tensor3, tensor3_bool, TestBackend};
 use guth::conditioner::text::LutConditioner;
 use guth::model::flow_lm::{FlowLmModel, FlowLmState};
 use guth::modules::flow_net::{SimpleMlpAdaLn, SimpleMlpAdaLnConfig};

@@ -1,10 +1,8 @@
-mod common;
-
 use burn::tensor::{Tensor, TensorData};
 use burn_ndarray::NdArrayDevice;
 use serde::Deserialize;
 
-use common::{assert_close, read_fixture, tensor3, TestBackend};
+use crate::common::{assert_close, read_fixture, tensor3, TestBackend};
 use guth::model::mimi::MimiModel;
 use guth::modules::dummy_quantizer::DummyQuantizer;
 use guth::modules::mimi_transformer::{
