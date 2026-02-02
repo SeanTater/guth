@@ -25,12 +25,17 @@ pub struct StreamingConvTranspose1d;
 pub struct StreamingConvState<B: Backend> {
     /// Cached input/output history for overlap.
     pub history: Option<Tensor<B, 3>>,
+    /// Track first chunk for replicate padding parity with the Python implementation.
+    pub is_first: bool,
 }
 
 impl<B: Backend> Default for StreamingConvState<B> {
     /// Create an empty streaming state with no history.
     fn default() -> Self {
-        Self { history: None }
+        Self {
+            history: None,
+            is_first: true,
+        }
     }
 }
 
@@ -107,6 +112,16 @@ impl<B: Backend> StreamingConv1dOp<B> {
         }
 
         let history_len = state.history.as_ref().map(|h| h.dims()[2]).unwrap_or(0);
+        if self.config.pad_mode == PaddingMode::Replicate && state.is_first && history_len > 0 {
+            // Python StreamingConv1d fills the initial history by repeating the first sample
+            // when pad_mode is replicate; do the same to keep Mimi encode parity.
+            let first = input.clone().narrow(2, 0, 1).repeat_dim(2, history_len);
+            if let Some(history) = state.history.as_mut() {
+                *history = first;
+            } else {
+                state.history = Some(first);
+            }
+        }
         let mut extended = if let Some(history) = state.history.take() {
             Tensor::cat(vec![history, input], 2)
         } else {
@@ -159,6 +174,7 @@ impl<B: Backend> StreamingConv1dOp<B> {
         } else {
             state.history = None;
         }
+        state.is_first = false;
 
         output
     }

@@ -235,6 +235,16 @@ impl<B: Backend + 'static> TtsRuntime<B> {
         self.conditioning_from_audio_samples(samples, sample_rate)
     }
 
+    /// Compute a conditioning tensor from an audio file path, truncating if needed.
+    pub fn conditioning_from_audio_path_with_truncate(
+        &self,
+        path: impl AsRef<Path>,
+        max_seconds: f32,
+    ) -> Result<(Tensor<B, 3>, bool)> {
+        let (samples, sample_rate) = WavIo::read_audio(path)?;
+        self.conditioning_from_audio_samples_with_truncate(samples, sample_rate, max_seconds)
+    }
+
     /// Compute a conditioning tensor from raw audio samples.
     pub fn conditioning_from_audio_samples(
         &self,
@@ -252,6 +262,27 @@ impl<B: Backend + 'static> TtsRuntime<B> {
         let prompt_tensor = tensor_from_audio::<B>(prompt, &device);
         Ok(compute_conditioning(&self.model, prompt_tensor))
     }
+
+    /// Compute a conditioning tensor from raw audio samples, truncating if needed.
+    pub fn conditioning_from_audio_samples_with_truncate(
+        &self,
+        samples: Vec<Vec<f32>>,
+        sample_rate: u32,
+        max_seconds: f32,
+    ) -> Result<(Tensor<B, 3>, bool)> {
+        let mut prompt = AudioResampler::convert_audio(
+            samples,
+            sample_rate,
+            self.config.mimi.sample_rate as u32,
+            self.config.mimi.channels as usize,
+        )?;
+        // Truncate long prompts to keep conditioning stable and aligned with the Python CLI.
+        let max_samples = (max_seconds * self.config.mimi.sample_rate as f32).round() as usize;
+        let truncated = truncate_audio_samples(&mut prompt, max_samples);
+        let device = self.model.flow_lm.bos_emb.device();
+        let prompt_tensor = tensor_from_audio::<B>(prompt, &device);
+        Ok((compute_conditioning(&self.model, prompt_tensor), truncated))
+    }
 }
 
 /// Convert per-channel samples into a `[1, channels, samples]` tensor.
@@ -266,6 +297,20 @@ fn tensor_from_audio<B: Backend>(
         flat.extend(channel);
     }
     Tensor::from_data(TensorData::new(flat, [1, channels, len]), device)
+}
+
+fn truncate_audio_samples(samples: &mut [Vec<f32>], max_samples: usize) -> bool {
+    if samples.is_empty() {
+        return false;
+    }
+    let current_len = samples[0].len();
+    if current_len <= max_samples || max_samples == 0 {
+        return false;
+    }
+    for channel in samples {
+        channel.truncate(max_samples);
+    }
+    true
 }
 
 /// Project Mimi latents into FlowLM conditioning space.

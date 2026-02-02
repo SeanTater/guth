@@ -163,6 +163,12 @@ enum VoiceCommands {
         /// Model configuration YAML.
         #[arg(long, default_value = "python/pocket_tts/config/b6369a24.yaml")]
         config: PathBuf,
+        /// Truncate long audio prompts before encoding.
+        #[arg(long)]
+        truncate: bool,
+        /// Maximum duration in seconds when truncating.
+        #[arg(long, default_value_t = 30.0)]
+        truncate_seconds: f32,
     },
 }
 
@@ -188,6 +194,8 @@ struct VoiceEncodeArgs {
     input: PathBuf,
     output: PathBuf,
     config: PathBuf,
+    truncate: bool,
+    truncate_seconds: f32,
 }
 
 /// Entry point for the CLI.
@@ -268,11 +276,15 @@ fn main() -> Result<()> {
                 input,
                 output,
                 config,
+                truncate,
+                truncate_seconds,
             } => {
                 let args = VoiceEncodeArgs {
                     input,
                     output,
                     config,
+                    truncate,
+                    truncate_seconds,
                 };
                 match backend {
                     BackendChoice::Wgpu => {
@@ -340,6 +352,7 @@ fn run_say<B: Backend + Send + Sync + 'static>(
         args.eos_threshold.unwrap_or(-4.0),
     );
     let runtime = TtsRuntime::<B>::from_config_path(&config_path, params, device)?;
+    let flow_dim = runtime.model().flow_lm.dim;
     if interrupted.load(Ordering::SeqCst) {
         anyhow::bail!("Interrupted");
     }
@@ -355,14 +368,14 @@ fn run_say<B: Backend + Send + Sync + 'static>(
                 "Voice '{voice_name}' not found. Run `guth voices` to see available voices."
             )
         })?;
-        let conditioning = load_conditioning_tensor::<B>(&voice_path, device)?;
+        let conditioning = load_conditioning_tensor::<B>(&voice_path, device, flow_dim)?;
         runtime.condition_on_precomputed(conditioning, &mut state)?;
     } else if let Some(voice_path) = args.voice_file {
         if !runtime.voice_cloning_supported() {
             anyhow::bail!(VOICE_CLONING_UNSUPPORTED);
         }
         if is_safetensors_path(&voice_path) {
-            let conditioning = load_conditioning_tensor::<B>(&voice_path, device)?;
+            let conditioning = load_conditioning_tensor::<B>(&voice_path, device, flow_dim)?;
             runtime.condition_on_precomputed(conditioning, &mut state)?;
         } else {
             runtime.condition_on_audio_path(&voice_path, &mut state)?;
@@ -415,7 +428,17 @@ fn run_voice_encode<B: Backend>(args: VoiceEncodeArgs, device: &B::Device) -> Re
     if !runtime.voice_cloning_supported() {
         anyhow::bail!(VOICE_CLONING_UNSUPPORTED);
     }
-    let conditioning = runtime.conditioning_from_audio_path(args.input)?;
+    if args.truncate && args.truncate_seconds <= 0.0 {
+        anyhow::bail!("--truncate-seconds must be > 0");
+    }
+    let (conditioning, truncated) = if args.truncate {
+        runtime.conditioning_from_audio_path_with_truncate(args.input, args.truncate_seconds)?
+    } else {
+        (runtime.conditioning_from_audio_path(args.input)?, false)
+    };
+    if truncated {
+        eprintln!("Truncated voice prompt to {:.1}s", args.truncate_seconds);
+    }
     save_tensor(&args.output, "audio_prompt", conditioning)
 }
 
@@ -463,6 +486,7 @@ fn is_safetensors_path(path: &Path) -> bool {
 fn load_conditioning_tensor<B: Backend>(
     path: &Path,
     device: &B::Device,
+    expected_dim: usize,
 ) -> Result<Tensor<B, 3>> {
     let data = std::fs::read(path)?;
     let safetensors = safetensors::SafeTensors::deserialize(&data)?;
@@ -476,14 +500,42 @@ fn load_conditioning_tensor<B: Backend>(
     if shape.len() != 3 {
         anyhow::bail!("Expected 3D tensor, got {}D", shape.len());
     }
-    let mut values = Vec::with_capacity(tensor_view.data().len() / 4);
-    for chunk in tensor_view.data().chunks_exact(4) {
-        values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    let mut values = Vec::new();
+    match tensor_view.dtype() {
+        safetensors::Dtype::F32 => {
+            values.reserve(tensor_view.data().len() / 4);
+            for chunk in tensor_view.data().chunks_exact(4) {
+                values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+        }
+        safetensors::Dtype::BF16 => {
+            values.reserve(tensor_view.data().len() / 2);
+            for chunk in tensor_view.data().chunks_exact(2) {
+                let bits = u16::from_le_bytes(chunk.try_into().unwrap()) as u32;
+                values.push(f32::from_bits(bits << 16));
+            }
+        }
+        other => anyhow::bail!("Unsupported conditioning dtype {:?}", other),
     }
-    Ok(Tensor::from_data(
-        TensorData::new(values, [shape[0], shape[1], shape[2]]),
-        device,
-    ))
+
+    // Conditioning tensors are expected to be [batch, seq, dim]. Some legacy
+    // exports used [batch, dim, seq], so detect and swap to avoid silent misuse.
+    let batch = shape[0];
+    let dim0 = shape[1];
+    let dim1 = shape[2];
+    let conditioning = Tensor::from_data(TensorData::new(values, [batch, dim0, dim1]), device);
+    if dim1 == expected_dim {
+        Ok(conditioning)
+    } else if dim0 == expected_dim {
+        eprintln!(
+            "Warning: conditioning tensor is [batch, dim, seq]; swapping to [batch, seq, dim]."
+        );
+        Ok(conditioning.swap_dims(1, 2))
+    } else {
+        anyhow::bail!(
+            "Conditioning dim mismatch: expected last dim {expected_dim}, got shape {shape:?}"
+        );
+    }
 }
 
 /// Resolve a built-in voice name to an on-disk file path.
