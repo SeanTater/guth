@@ -3,6 +3,7 @@
 //! This module caches key/value tensors so attention can be computed over
 //! incremental chunks while preserving causality and optional context windows.
 
+use crate::perf::{self, Metric};
 use crate::state::StreamingModule;
 use burn::tensor::{activation::softmax, backend::Backend, Bool, Int, Tensor};
 use std::marker::PhantomData;
@@ -95,6 +96,7 @@ impl<B: Backend> StreamingMhaOp<B> {
         keys: Tensor<B, 4>,
         values: Tensor<B, 4>,
     ) {
+        let _span = perf::span(Metric::MhaAppendKv);
         let added = keys.dims()[2];
         let combined_keys = match state.keys.take() {
             Some(existing) => Tensor::cat(vec![existing, keys], 2),
@@ -122,6 +124,7 @@ impl<B: Backend> StreamingMhaOp<B> {
 
     /// Apply rotary position embeddings (RoPE) to a tensor chunk.
     pub fn apply_rope(&self, tensor: Tensor<B, 4>, start: usize) -> Tensor<B, 4> {
+        let _span = perf::span(Metric::MhaApplyRope);
         let [batch, heads, seq, dim] = tensor.dims();
         if dim < 2 {
             return tensor;
@@ -199,6 +202,7 @@ impl<B: Backend> StreamingMhaOp<B> {
 
     /// Compute attention over cached keys/values for the given queries.
     pub fn attention(&self, state: &StreamingMhaState<B>, queries: Tensor<B, 4>) -> Tensor<B, 4> {
+        let _span = perf::span(Metric::MhaAttention);
         let keys = state.keys.clone().expect("keys must be set");
         let values = state.values.clone().expect("values must be set");
         let batch = queries.dims()[0];
@@ -247,6 +251,7 @@ impl<B: Backend> StreamingMhaOp<B> {
         if !self.config.causal && self.config.context.is_none() {
             return None;
         }
+        let _span = perf::span(Metric::MhaBuildMask);
 
         let q: Tensor<B, 2, Int> =
             Tensor::<B, 1, Int>::arange(q_start as i64..(q_start + q_len) as i64, device)

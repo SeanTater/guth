@@ -9,6 +9,7 @@ use crate::audio::resample::AudioResampler;
 use crate::conditioner::text::TextTokenizer;
 use crate::config::{load_config, Config};
 use crate::model::tts::{TtsModel, TtsState};
+use crate::perf::{self, Metric};
 use anyhow::Result;
 use burn::tensor::backend::Backend;
 use burn::tensor::module::linear;
@@ -75,12 +76,14 @@ impl<B: Backend + 'static> TtsRuntime<B> {
         params: RuntimeParams,
         device: &B::Device,
     ) -> Result<Self> {
+        let _span = perf::span(Metric::RuntimeFromConfigPath);
         let config = load_config(path)?;
         Self::from_config(&config, params, device)
     }
 
     /// Create a runtime from an already-loaded config.
     pub fn from_config(config: &Config, params: RuntimeParams, device: &B::Device) -> Result<Self> {
+        let _span = perf::span(Metric::RuntimeFromConfig);
         let model = TtsModel::from_config(
             config,
             params.temp,
@@ -112,6 +115,7 @@ impl<B: Backend + 'static> TtsRuntime<B> {
 
     /// Prepare text into tokens and a suggested `frames_after_eos`.
     pub fn prepare_tokens(&self, text: &str) -> Result<(Tensor<B, 2, Int>, usize)> {
+        let _span = perf::span(Metric::RuntimePrepareTokens);
         let tokenizer = self
             .model
             .flow_lm
@@ -124,17 +128,16 @@ impl<B: Backend + 'static> TtsRuntime<B> {
         let tokens = tokens.into_iter().map(|v| v as i64).collect::<Vec<_>>();
         let device = self.model.flow_lm.bos_emb.device();
         let tokens_len = tokens.len();
-        let tokens =
-            Tensor::<B, 2, Int>::from_data(TensorData::new(tokens, [1, tokens_len]), &device);
+        let tokens = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(tokens, [1, tokens_len]),
+            &device,
+        );
+        perf::add_count(Metric::TtsTokens, tokens_len as u64);
         Ok((tokens, frames_after_eos))
     }
 
     /// Initialize generation state sized for the provided tokens and max length.
-    pub fn init_state_for_tokens(
-        &self,
-        tokens: &Tensor<B, 2, Int>,
-        max_gen_len: usize,
-    ) -> TtsState<B> {
+    pub fn init_state_for_tokens(&self, tokens: &Tensor<B, 2, Int>, max_gen_len: usize) -> TtsState<B> {
         let device = tokens.device();
         let flow_len = tokens.dims()[1] + max_gen_len + 1;
         self.model
@@ -201,6 +204,7 @@ impl<B: Backend + 'static> TtsRuntime<B> {
         path: impl AsRef<Path>,
         state: &mut TtsState<B>,
     ) -> Result<()> {
+        let _span = perf::span(Metric::RuntimeConditionOnAudioPath);
         let (samples, sample_rate) = WavIo::read_audio(path)?;
         self.condition_on_audio_samples(samples, sample_rate, state)
     }
@@ -212,6 +216,7 @@ impl<B: Backend + 'static> TtsRuntime<B> {
         sample_rate: u32,
         state: &mut TtsState<B>,
     ) -> Result<()> {
+        let _span = perf::span(Metric::RuntimeConditionOnAudioSamples);
         let prompt = AudioResampler::convert_audio(
             samples,
             sample_rate,
@@ -225,6 +230,7 @@ impl<B: Backend + 'static> TtsRuntime<B> {
 
     /// Compute a conditioning tensor from an audio file path.
     pub fn conditioning_from_audio_path(&self, path: impl AsRef<Path>) -> Result<Tensor<B, 3>> {
+        let _span = perf::span(Metric::RuntimeConditioningFromAudioPath);
         let (samples, sample_rate) = WavIo::read_audio(path)?;
         self.conditioning_from_audio_samples(samples, sample_rate)
     }
@@ -235,6 +241,7 @@ impl<B: Backend + 'static> TtsRuntime<B> {
         samples: Vec<Vec<f32>>,
         sample_rate: u32,
     ) -> Result<Tensor<B, 3>> {
+        let _span = perf::span(Metric::RuntimeConditioningFromAudioSamples);
         let prompt = AudioResampler::convert_audio(
             samples,
             sample_rate,
@@ -248,7 +255,10 @@ impl<B: Backend + 'static> TtsRuntime<B> {
 }
 
 /// Convert per-channel samples into a `[1, channels, samples]` tensor.
-fn tensor_from_audio<B: Backend>(samples: Vec<Vec<f32>>, device: &B::Device) -> Tensor<B, 3> {
+fn tensor_from_audio<B: Backend>(
+    samples: Vec<Vec<f32>>,
+    device: &B::Device,
+) -> Tensor<B, 3> {
     let channels = samples.len();
     let len = samples[0].len();
     let mut flat = Vec::with_capacity(channels * len);

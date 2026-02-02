@@ -1,6 +1,7 @@
 //! Benchmark binary for comparing backend performance.
 //!
 //! This binary is only built when a backend feature is enabled.
+#![recursion_limit = "256"]
 #![allow(dead_code, unused_variables)]
 
 use anyhow::Result;
@@ -9,6 +10,7 @@ use burn::tensor::{Int, Tensor, TensorData};
 use guth::conditioner::text::TextTokenizer;
 use guth::config::load_config;
 use guth::model::tts::TtsModel;
+use guth::perf;
 use std::time::Instant;
 
 /// Parsed benchmark arguments.
@@ -20,6 +22,8 @@ struct BenchArgs {
     max_gen_len: usize,
     /// Whether to run in streaming mode.
     stream: bool,
+    /// Whether to print the perf summary at the end.
+    perf: bool,
 }
 
 /// Parse CLI args for the benchmark runner.
@@ -28,6 +32,7 @@ fn parse_args() -> (String, BenchArgs) {
     let mut iters = 3usize;
     let mut max_gen_len = 32usize;
     let mut stream = false;
+    let mut perf = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -50,6 +55,9 @@ fn parse_args() -> (String, BenchArgs) {
             "--stream" => {
                 stream = true;
             }
+            "--perf" | "--verbose" => {
+                perf = true;
+            }
             _ => {}
         }
     }
@@ -60,6 +68,7 @@ fn parse_args() -> (String, BenchArgs) {
             iters,
             max_gen_len,
             stream,
+            perf,
         },
     )
 }
@@ -121,11 +130,20 @@ fn run_bench<B: Backend>(
         "{name}: avg {:.2} ms over {} iters (max_gen_len={}, stream={})",
         avg_ms, args.iters, args.max_gen_len, args.stream
     );
+    if args.perf {
+        eprintln!("{}", perf::report());
+    }
     Ok(())
 }
 
 /// Entry point for the benchmark binary.
 fn main() -> Result<()> {
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn"),
+    )
+    .format_timestamp_millis()
+    .try_init();
+
     let (config_path, args) = parse_args();
 
     #[cfg(feature = "backend-ndarray")]
@@ -147,7 +165,14 @@ fn main() -> Result<()> {
         use burn_wgpu::graphics::AutoGraphicsApi;
         use burn_wgpu::{init_setup, Wgpu, WgpuDevice};
         let device = WgpuDevice::default();
-        init_setup::<AutoGraphicsApi>(&device, Default::default());
+        let setup = init_setup::<AutoGraphicsApi>(&device, Default::default());
+        if args.perf {
+            let info = setup.adapter.get_info();
+            eprintln!("wgpu.adapter: {:?}", info);
+            eprintln!("wgpu.backend: {:?}", setup.backend);
+            eprintln!("wgpu.features: {:?}", setup.adapter.features());
+            eprintln!("wgpu.limits: {:?}", setup.adapter.limits());
+        }
         run_bench::<Wgpu>("wgpu", &device, &config_path, args)?;
     }
     Ok(())

@@ -33,6 +33,9 @@ path = "src/main.rs"
 burn = { version = "0.20.1", features = ["ndarray"] }
 burn-nn = "0.20.1"
 burn-ndarray = "0.20.1"
+burn-cpu = { version = "0.20.1", optional = true }
+burn-wgpu = { version = "0.20.1", optional = true, default-features = false, features = ["std", "fusion", "vulkan"] }
+env_logger = "0.11"
 safetensors = "0.4"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
 sentencepiece = "0.13.1"
@@ -56,9 +59,9 @@ nix = { version = "0.28", default-features = false, features = ["signal"] }
 
 [features]
 default = []
-backend-cpu = []
+backend-cpu = ["burn-cpu"]
 backend-ndarray = []
-backend-wgpu = []
+backend-wgpu = ["burn-wgpu"]
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"

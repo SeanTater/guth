@@ -11,6 +11,7 @@ use guth::audio::io::StreamingWavWriter;
 use guth::audio::io::WavIo;
 use guth::audio::resample::AudioResampler;
 use guth::config::load_config;
+use guth::perf;
 use guth::runtime::{RuntimeParams, TtsRuntime};
 use safetensors::Dtype;
 use std::collections::HashMap;
@@ -26,6 +27,9 @@ Use --voice with a built-in voice, or download the full weights for voice clonin
 #[command(name = "guth")]
 #[command(about = "Rust rewrite of pocket-tts", long_about = None)]
 struct Cli {
+    /// Print performance summary at the end of the run.
+    #[arg(long, short, global = true)]
+    verbose: bool,
     /// Subcommand to execute.
     #[command(subcommand)]
     command: Commands,
@@ -138,6 +142,7 @@ enum VoiceCommands {
 /// Entry point for the CLI.
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let verbose = cli.verbose;
 
     match cli.command {
         Commands::Say {
@@ -288,6 +293,10 @@ fn main() -> Result<()> {
                 WavIo::write_wav(output, &converted, to_rate)?;
             }
         },
+    }
+
+    if verbose {
+        eprintln!("{}", perf::report());
     }
 
     Ok(())

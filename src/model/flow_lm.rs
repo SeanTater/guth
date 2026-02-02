@@ -17,6 +17,7 @@ use crate::{
         },
     },
     weights::TensorData as WeightTensor,
+    perf::{self, Metric},
 };
 use burn::{
     module::Param,
@@ -200,9 +201,14 @@ impl<B: Backend + 'static> FlowLmModel<B> {
             sequence.mask_where(nan_mask, bos)
         };
 
-        let input_ = apply_linear_3d(&self.input_linear, sequence.clone());
-        let transformer_out =
-            self.backbone(input_, text_embeddings, seq_len, &mut state.transformer);
+        let input_ = {
+            let _span = perf::span(Metric::FlowLmInputLinear);
+            apply_linear_3d(&self.input_linear, sequence.clone())
+        };
+        let transformer_out = {
+            let _span = perf::span(Metric::FlowLmBackbone);
+            self.backbone(input_, text_embeddings, seq_len, &mut state.transformer)
+        };
         let last_index = if seq_len == 0 {
             transformer_out.dims()[1].saturating_sub(1)
         } else {
@@ -211,17 +217,23 @@ impl<B: Backend + 'static> FlowLmModel<B> {
         let last = transformer_out
             .narrow(1, last_index, 1)
             .reshape([batch, self.dim]);
-        let eos_logits = self.out_eos.forward(last.clone());
+        let eos_logits = {
+            let _span = perf::span(Metric::FlowLmEos);
+            self.out_eos.forward(last.clone())
+        };
         let eos = eos_logits.greater_elem(eos_threshold);
 
         assert!(lsd_decode_steps > 0, "lsd_decode_steps must be > 0");
         let noise = make_noise::<B>([batch, self.ldim], temp, noise_clamp, &device);
         let conditioned = last;
-        let output = lsd_decode(
-            |s, t, x| self.flow_net.forward(conditioned.clone(), s, t, x),
-            noise,
-            lsd_decode_steps,
-        );
+        let output = {
+            let _span = perf::span(Metric::FlowNetLsdDecode);
+            lsd_decode(
+                |s, t, x| self.flow_net.forward(conditioned.clone(), s, t, x),
+                noise,
+                lsd_decode_steps,
+            )
+        };
 
         (output, eos)
     }

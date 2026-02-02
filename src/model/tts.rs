@@ -14,12 +14,14 @@ use crate::{
         load_flow_lm_state_dict, load_mimi_state_dict, load_tts_state_dict,
         TensorData as WeightTensor,
     },
+    perf::{self, Metric},
 };
 use burn::tensor::{
     backend::Backend, module::linear, Bool, ElementConversion, Int, Tensor,
     TensorData as BurnTensorData,
 };
 use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
 
 /// State container for streaming TTS generation.
 ///
@@ -129,7 +131,18 @@ impl<B: Backend + 'static> TtsModel<B> {
                     }
                 }
             };
-            let tts_state = load_tts_state_dict(&weights_path)?;
+            let tts_state = match load_tts_state_dict(&weights_path) {
+                Ok(state) => state,
+                Err(err) => {
+                    if let Some(fallback) = config.weights_path_without_voice_cloning.as_ref() {
+                        used_fallback = true;
+                        let fallback_path = download_if_necessary(fallback)?;
+                        load_tts_state_dict(&fallback_path)?
+                    } else {
+                        return Err(err);
+                    }
+                }
+            };
             if !tts_state.flow_lm.is_empty() {
                 flow_lm.load_state_dict(&tts_state.flow_lm, device)?;
             }
@@ -249,8 +262,9 @@ impl<B: Backend + 'static> TtsModel<B> {
         let mut eos_step: Option<usize> = None;
 
         for step in 0..max_gen_len {
+            let input = backbone_input;
             let (latent, is_eos) =
-                self.run_flow_lm_and_increment(state, None, Some(backbone_input.clone()), None)?;
+                self.run_flow_lm_and_increment(state, None, Some(input), None)?;
             if eos_step.is_none() {
                 let eos_any = is_eos.clone().any().into_scalar();
                 if eos_any.elem() {
@@ -321,9 +335,17 @@ impl<B: Backend + 'static> TtsModel<B> {
         max_gen_len: usize,
         frames_after_eos: usize,
     ) -> anyhow::Result<(Tensor<B, 3>, Tensor<B, 2, Bool>, Tensor<B, 3>)> {
+        let _span = perf::span(Metric::TtsGenerateBatch);
+        let start = Instant::now();
         let (latents, eos) =
             self.generate_latents_from_tokens(tokens, state, max_gen_len, frames_after_eos)?;
+        perf::add_duration(Metric::FlowLmTotal, start.elapsed());
+
+        let start = Instant::now();
         let audio = self.decode_latents(latents.clone(), state);
+        perf::add_duration(Metric::MimiDecodeTotal, start.elapsed());
+        perf::add_count(Metric::MimiFrames, latents.dims()[1] as u64);
+        perf::add_count(Metric::MimiSamples, audio.dims()[2] as u64);
         Ok((latents, eos, audio))
     }
 
@@ -359,6 +381,7 @@ impl<B: Backend + 'static> TtsModel<B> {
     {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
+            let _span = perf::span(Metric::TtsGenerateStream);
             let device = tokens.device();
 
             // Initial text conditioning - no audio conditioning, so dimension mismatch cannot occur.
@@ -370,12 +393,18 @@ impl<B: Backend + 'static> TtsModel<B> {
             let mut backbone_input =
                 Tensor::<B, 3>::full([1, 1, self.flow_lm.ldim], f32::NAN, &device);
             let mut eos_step: Option<usize> = None;
+            let mut flow_time = Duration::ZERO;
+            let mut mimi_time = Duration::ZERO;
+            let mut frames: u64 = 0;
+            let mut samples: u64 = 0;
             for step in 0..max_gen_len {
                 // Generation loop - no audio conditioning, so dimension mismatch cannot occur.
+                let input = backbone_input;
+                let start = Instant::now();
                 let (latent, is_eos) = match self.run_flow_lm_and_increment(
                     &mut state,
                     None,
-                    Some(backbone_input.clone()),
+                    Some(input),
                     None,
                 ) {
                     Ok(result) => result,
@@ -384,24 +413,32 @@ impl<B: Backend + 'static> TtsModel<B> {
                         break;
                     }
                 };
+                flow_time += start.elapsed();
                 if eos_step.is_none() {
                     let eos_any = is_eos.clone().any().into_scalar();
                     if eos_any.elem() {
                         eos_step = Some(step);
                     }
                 }
-                let latent_step = latent.clone().reshape([1, 1, self.flow_lm.ldim]);
-                let audio = self.decode_latent_step(latent_step, &mut state.mimi);
+                let start = Instant::now();
+                let audio = self.decode_latent_step(latent.clone(), &mut state.mimi);
+                mimi_time += start.elapsed();
+                frames += 1;
+                samples += audio.dims()[2] as u64;
                 if tx.send(audio).is_err() {
                     break;
                 }
-                backbone_input = latent.reshape([1, 1, self.flow_lm.ldim]);
+                backbone_input = latent;
                 if let Some(eos_step) = eos_step {
                     if step >= eos_step + frames_after_eos {
                         break;
                     }
                 }
             }
+            perf::add_duration(Metric::FlowLmTotal, flow_time);
+            perf::add_duration(Metric::MimiDecodeTotal, mimi_time);
+            perf::add_count(Metric::MimiFrames, frames);
+            perf::add_count(Metric::MimiSamples, samples);
         });
         rx
     }
@@ -476,7 +513,7 @@ impl<B: Backend + 'static> TtsModel<B> {
                 );
             }
         }
-        let text_embeddings = Tensor::cat(vec![text_embeddings, audio_conditioning.clone()], 1);
+        let text_embeddings = Tensor::cat(vec![text_embeddings, audio_conditioning], 1);
 
         let (latent, is_eos) = self.flow_lm.sample_next_latent(
             backbone_input_latents,

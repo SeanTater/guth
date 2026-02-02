@@ -98,6 +98,8 @@ pub mod audio;
 pub mod config;
 pub mod download;
 pub mod runtime;
+#[doc(hidden)]
+pub mod perf;
 
 // Internal modules - exposed for integration tests but not part of stable API.
 // These may change without notice between versions.

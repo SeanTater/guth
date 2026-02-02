@@ -64,21 +64,20 @@ pub fn split_qkv<B: Backend>(
     head_dim: usize,
 ) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {
     let [batch, seq, _] = qkv.dims();
-    let qkv = qkv.reshape([batch, seq, 3, num_heads, head_dim]);
+    let qkv = qkv
+        .reshape([batch, seq, 3, num_heads, head_dim])
+        .swap_dims(1, 3);
     let q = qkv
         .clone()
         .narrow(2, 0, 1)
-        .reshape([batch, seq, num_heads, head_dim])
-        .swap_dims(1, 2);
+        .reshape([batch, num_heads, seq, head_dim]);
     let k = qkv
         .clone()
         .narrow(2, 1, 1)
-        .reshape([batch, seq, num_heads, head_dim])
-        .swap_dims(1, 2);
+        .reshape([batch, num_heads, seq, head_dim]);
     let v = qkv
         .narrow(2, 2, 1)
-        .reshape([batch, seq, num_heads, head_dim])
-        .swap_dims(1, 2);
+        .reshape([batch, num_heads, seq, head_dim]);
     (q, k, v)
 }
 

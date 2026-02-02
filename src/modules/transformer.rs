@@ -8,6 +8,7 @@ use crate::modules::linear::{apply_layer_norm_3d, apply_linear_3d, merge_heads, 
 use crate::modules::streaming_mha::{
     StreamingMha, StreamingMhaConfig, StreamingMhaOp, StreamingMhaState,
 };
+use crate::perf::{self, Metric};
 use crate::state::StreamingModule;
 use burn::tensor::{activation::gelu, backend::Backend, Tensor};
 use burn_nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig};
@@ -130,31 +131,37 @@ impl<B: Backend + 'static> StreamingTransformerLayer<B> {
         state: &mut StreamingTransformerLayerState<B>,
     ) -> Tensor<B, 3> {
         let residual = input.clone();
-        let normalized = apply_layer_norm_3d(&self.norm1, input);
-        let qkv = self.apply_linear(&self.qkv, normalized);
-        let (queries, keys, values) = split_qkv(qkv, self.num_heads, self.head_dim);
+        let hidden = {
+            let _span = perf::span(Metric::TransformerAttn);
+            let normalized = apply_layer_norm_3d(&self.norm1, input);
+            let qkv = self.apply_linear(&self.qkv, normalized);
+            let (queries, keys, values) = split_qkv(qkv, self.num_heads, self.head_dim);
 
-        let start = state.mha.step;
-        let queries = self.mha.apply_rope(queries, start);
-        let keys = self.mha.apply_rope(keys, start);
+            let start = state.mha.step;
+            let queries = self.mha.apply_rope(queries, start);
+            let keys = self.mha.apply_rope(keys, start);
 
-        self.mha.append_kv(&mut state.mha, keys, values);
-        let attn = self.mha.attention(&state.mha, queries);
-        let attn = merge_heads(attn);
-        let attn = self.apply_linear(&self.out_proj, attn);
-        let attn = match &self.layer_scale_1 {
-            Some(scale) => scale.apply(attn),
-            None => attn,
+            self.mha.append_kv(&mut state.mha, keys, values);
+            let attn = self.mha.attention(&state.mha, queries);
+            let attn = merge_heads(attn);
+            let attn = self.apply_linear(&self.out_proj, attn);
+            let attn = match &self.layer_scale_1 {
+                Some(scale) => scale.apply(attn),
+                None => attn,
+            };
+            residual.add(attn)
         };
-        let hidden = residual.add(attn);
 
-        let ffn_input = apply_layer_norm_3d(&self.norm2, hidden.clone());
-        let ffn = self.apply_linear(&self.ffn_in, ffn_input);
-        let ffn = gelu(ffn);
-        let ffn = self.apply_linear(&self.ffn_out, ffn);
-        let ffn = match &self.layer_scale_2 {
-            Some(scale) => scale.apply(ffn),
-            None => ffn,
+        let ffn = {
+            let _span = perf::span(Metric::TransformerFfn);
+            let ffn_input = apply_layer_norm_3d(&self.norm2, hidden.clone());
+            let ffn = self.apply_linear(&self.ffn_in, ffn_input);
+            let ffn = gelu(ffn);
+            let ffn = self.apply_linear(&self.ffn_out, ffn);
+            match &self.layer_scale_2 {
+                Some(scale) => scale.apply(ffn),
+                None => ffn,
+            }
         };
 
         hidden.add(ffn)

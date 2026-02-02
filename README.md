@@ -83,6 +83,29 @@ guth voice encode --input voice.wav --output voice.safetensors --config python/p
 guth say "Hello." --voice-file voice.safetensors --output out.wav --config python/pocket_tts/config/b6369a24.yaml
 ```
 
+## Performance
+
+The CLI collects coarse performance timings and counters by default. Use `--verbose`
+to print a summary at the end of a run.
+For meaningful comparisons, prefer `--release` builds.
+On supported GPUs, the WGPU backend is the preferred performance path (see `backend-wgpu`).
+
+## Burn Notes
+
+Known Burn backend issues and the workarounds we carry are tracked in
+`docs/burn-issues.md`.
+
+## Profiling
+
+For on-demand CPU sampling profiles, use `samply`:
+
+```bash
+CARGO_PROFILE_RELEASE_DEBUG=1 RUSTFLAGS="-Cforce-frame-pointers=yes" \
+samply record --save-only -o scratch/prof-tts.json -- \
+  cargo run --release --features backend-ndarray --bin bench -- \
+  --config python/pocket_tts/config/b6369a24.yaml --iters 3 --max-gen-len 256 --stream
+```
+
 ## Configuration
 
 Models are configured via YAML files. Weight paths support:
