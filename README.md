@@ -24,6 +24,9 @@ guth = "0.1"
 burn-ndarray = "0.20"  # or another Burn backend
 ```
 
+For the CLI, WGPU is enabled by default. Use `--backend ndarray` for CPU runs, or build
+a CPU-only binary with `--no-default-features --features backend-ndarray`.
+
 ## Quick Start
 
 Use `TtsRuntime` for a convenience wrapper around config + model loading:
@@ -88,7 +91,8 @@ guth say "Hello." --voice-file voice.safetensors --output out.wav --config pytho
 The CLI collects coarse performance timings and counters by default. Use `--verbose`
 to print a summary at the end of a run.
 For meaningful comparisons, prefer `--release` builds.
-On supported GPUs, the WGPU backend is the preferred performance path (see `backend-wgpu`).
+On supported GPUs, the WGPU backend is the preferred performance path and is the CLI default.
+Use `--backend ndarray` to opt into CPU execution.
 
 ## Burn Notes
 
@@ -102,7 +106,7 @@ For on-demand CPU sampling profiles, use `samply`:
 ```bash
 CARGO_PROFILE_RELEASE_DEBUG=1 RUSTFLAGS="-Cforce-frame-pointers=yes" \
 samply record --save-only -o scratch/prof-tts.json -- \
-  cargo run --release --features backend-ndarray --bin bench -- \
+  cargo run --release --no-default-features --features backend-ndarray --bin bench -- \
   --config python/pocket_tts/config/b6369a24.yaml --iters 3 --max-gen-len 256 --stream
 ```
 

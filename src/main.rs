@@ -3,10 +3,14 @@
 //! The CLI wraps the core model to provide speech synthesis, voice encoding,
 //! model downloads, and basic audio conversion utilities.
 
+#![recursion_limit = "256"]
+
 use anyhow::Result;
+use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use burn_ndarray::{NdArray, NdArrayDevice};
 use clap::{Parser, Subcommand};
+use clap::ValueEnum;
 use guth::audio::io::StreamingWavWriter;
 use guth::audio::io::WavIo;
 use guth::audio::resample::AudioResampler;
@@ -19,8 +23,28 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+#[cfg(feature = "backend-wgpu")]
+use burn_wgpu::graphics::AutoGraphicsApi;
+#[cfg(feature = "backend-wgpu")]
+use burn_wgpu::{init_setup, Wgpu, WgpuDevice};
+
 const VOICE_CLONING_UNSUPPORTED: &str = "Voice cloning weights are unavailable. \
 Use --voice with a built-in voice, or download the full weights for voice cloning.";
+
+/// Supported compute backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum BackendChoice {
+    /// Use the WGPU backend (GPU acceleration when available).
+    Wgpu,
+    /// Use the ndarray backend (CPU).
+    Ndarray,
+}
+
+#[cfg(feature = "backend-wgpu")]
+const DEFAULT_BACKEND: BackendChoice = BackendChoice::Wgpu;
+#[cfg(not(feature = "backend-wgpu"))]
+const DEFAULT_BACKEND: BackendChoice = BackendChoice::Ndarray;
 
 /// Top-level CLI options.
 #[derive(Parser)]
@@ -30,6 +54,9 @@ struct Cli {
     /// Print performance summary at the end of the run.
     #[arg(long, short, global = true)]
     verbose: bool,
+    /// Compute backend to use.
+    #[arg(long, value_enum, default_value_t = DEFAULT_BACKEND, global = true)]
+    backend: BackendChoice,
     /// Subcommand to execute.
     #[command(subcommand)]
     command: Commands,
@@ -139,10 +166,35 @@ enum VoiceCommands {
     },
 }
 
+#[derive(Debug, Clone)]
+struct SayArgs {
+    text: String,
+    voice: Option<String>,
+    voice_file: Option<PathBuf>,
+    output: Option<PathBuf>,
+    config: PathBuf,
+    temp: Option<f32>,
+    lsd_decode_steps: Option<usize>,
+    noise_clamp: Option<f32>,
+    eos_threshold: Option<f32>,
+    max_gen_len: Option<usize>,
+    frames_after_eos: Option<usize>,
+    stream: bool,
+    progress: bool,
+}
+
+#[derive(Debug, Clone)]
+struct VoiceEncodeArgs {
+    input: PathBuf,
+    output: PathBuf,
+    config: PathBuf,
+}
+
 /// Entry point for the CLI.
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let verbose = cli.verbose;
+    let backend = cli.backend;
 
     match cli.command {
         Commands::Say {
@@ -160,85 +212,44 @@ fn main() -> Result<()> {
             stream,
             progress,
         } => {
+            let args = SayArgs {
+                text,
+                voice,
+                voice_file,
+                output,
+                config,
+                temp,
+                lsd_decode_steps,
+                noise_clamp,
+                eos_threshold,
+                max_gen_len,
+                frames_after_eos,
+                stream,
+                progress,
+            };
             let interrupted = Arc::new(AtomicBool::new(false));
             let interrupt_flag = Arc::clone(&interrupted);
             ctrlc::set_handler(move || {
                 interrupt_flag.store(true, Ordering::SeqCst);
             })?;
-            let config_path = resolve_config_path(config);
-            let device = NdArrayDevice::default();
-            let params = RuntimeParams::new(
-                temp.unwrap_or(0.0),
-                lsd_decode_steps.unwrap_or(2),
-                noise_clamp,
-                eos_threshold.unwrap_or(-4.0),
-            );
-            let runtime =
-                TtsRuntime::<NdArray<f32>>::from_config_path(&config_path, params, &device)?;
-            let (tokens, frames_after_eos_guess) = runtime.prepare_tokens(&text)?;
-
-            let max_gen_len = max_gen_len.unwrap_or(256);
-            let frames_after_eos = frames_after_eos.unwrap_or(frames_after_eos_guess);
-            let mut state = runtime.init_state_for_tokens(&tokens, max_gen_len);
-
-            // Apply voice conditioning if specified
-            if let Some(voice_name) = voice {
-                // Predefined voice - load pre-computed conditioning tensor
-                let voice_path = resolve_voice_path(&voice_name).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Voice '{voice_name}' not found. Run `guth voices` to see available voices."
-                    )
-                })?;
-                let conditioning = load_conditioning_tensor(&voice_path, &device)?;
-                runtime.condition_on_precomputed(conditioning, &mut state)?;
-            } else if let Some(voice_path) = voice_file {
-                if !runtime.voice_cloning_supported() {
-                    anyhow::bail!(VOICE_CLONING_UNSUPPORTED);
-                }
-                // Custom voice file - compute conditioning from audio or load safetensors.
-                if is_safetensors_path(&voice_path) {
-                    let conditioning = load_conditioning_tensor(&voice_path, &device)?;
-                    runtime.condition_on_precomputed(conditioning, &mut state)?;
-                } else {
-                    runtime.condition_on_audio_path(&voice_path, &mut state)?;
-                }
-            }
-
-            let output_path = output.ok_or_else(|| anyhow::anyhow!("--output is required"))?;
-            let sample_rate = runtime.config().mimi.sample_rate as u32;
-            let channels = runtime.config().mimi.channels as usize;
-            if stream {
-                let receiver = runtime.generate_audio_stream_with_state(
-                    tokens,
-                    state,
-                    max_gen_len,
-                    frames_after_eos,
-                );
-                let mut writer = StreamingWavWriter::create(output_path, sample_rate, channels)?;
-                for (chunk_idx, chunk) in receiver.into_iter().enumerate() {
-                    if interrupted.load(Ordering::SeqCst) {
-                        writer.finalize()?;
-                        anyhow::bail!("Interrupted");
+            match backend {
+                BackendChoice::Wgpu => {
+                    #[cfg(feature = "backend-wgpu")]
+                    {
+                        let device = WgpuDevice::default();
+                        init_setup::<AutoGraphicsApi>(&device, Default::default());
+                        run_say::<Wgpu>(args, &device, interrupted)?;
                     }
-                    let audio_vec = audio_to_vec(chunk);
-                    writer.write_chunk(&audio_vec)?;
-                    if progress {
-                        eprintln!("wrote chunk {chunk_idx}");
+                    #[cfg(not(feature = "backend-wgpu"))]
+                    {
+                        let _ = args;
+                        anyhow::bail!("WGPU backend not enabled; build with --features backend-wgpu");
                     }
                 }
-                writer.finalize()?;
-            } else {
-                let (_latents, _eos, audio) = runtime.generate_audio_from_tokens(
-                    tokens,
-                    &mut state,
-                    max_gen_len,
-                    frames_after_eos,
-                )?;
-                if interrupted.load(Ordering::SeqCst) {
-                    anyhow::bail!("Interrupted");
+                BackendChoice::Ndarray => {
+                    let device = NdArrayDevice::default();
+                    run_say::<NdArray<f32>>(args, &device, interrupted)?;
                 }
-                let audio_vec = audio_to_vec(audio);
-                WavIo::write_wav(output_path, &audio_vec, sample_rate)?;
             }
         }
         Commands::Voices => {
@@ -258,18 +269,32 @@ fn main() -> Result<()> {
                 output,
                 config,
             } => {
-                let device = NdArrayDevice::default();
-                let params = RuntimeParams::new(0.0, 2, None, 0.0);
-                let runtime = TtsRuntime::<NdArray<f32>>::from_config_path(
-                    resolve_config_path(config),
-                    params,
-                    &device,
-                )?;
-                if !runtime.voice_cloning_supported() {
-                    anyhow::bail!(VOICE_CLONING_UNSUPPORTED);
+                let args = VoiceEncodeArgs {
+                    input,
+                    output,
+                    config,
+                };
+                match backend {
+                    BackendChoice::Wgpu => {
+                        #[cfg(feature = "backend-wgpu")]
+                        {
+                            let device = WgpuDevice::default();
+                            init_setup::<AutoGraphicsApi>(&device, Default::default());
+                            run_voice_encode::<Wgpu>(args, &device)?;
+                        }
+                        #[cfg(not(feature = "backend-wgpu"))]
+                        {
+                            let _ = args;
+                            anyhow::bail!(
+                                "WGPU backend not enabled; build with --features backend-wgpu"
+                            );
+                        }
+                    }
+                    BackendChoice::Ndarray => {
+                        let device = NdArrayDevice::default();
+                        run_voice_encode::<NdArray<f32>>(args, &device)?;
+                    }
                 }
-                let conditioning = runtime.conditioning_from_audio_path(input)?;
-                save_tensor(&output, "audio_prompt", conditioning)?;
             }
         },
         Commands::Models => {
@@ -302,8 +327,100 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn run_say<B: Backend + Send + Sync + 'static>(
+    args: SayArgs,
+    device: &B::Device,
+    interrupted: Arc<AtomicBool>,
+) -> Result<()> {
+    let config_path = resolve_config_path(args.config);
+    let params = RuntimeParams::new(
+        args.temp.unwrap_or(0.0),
+        args.lsd_decode_steps.unwrap_or(2),
+        args.noise_clamp,
+        args.eos_threshold.unwrap_or(-4.0),
+    );
+    let runtime = TtsRuntime::<B>::from_config_path(&config_path, params, device)?;
+    if interrupted.load(Ordering::SeqCst) {
+        anyhow::bail!("Interrupted");
+    }
+    let (tokens, frames_after_eos_guess) = runtime.prepare_tokens(&args.text)?;
+
+    let max_gen_len = args.max_gen_len.unwrap_or(256);
+    let frames_after_eos = args.frames_after_eos.unwrap_or(frames_after_eos_guess);
+    let mut state = runtime.init_state_for_tokens(&tokens, max_gen_len);
+
+    if let Some(voice_name) = args.voice {
+        let voice_path = resolve_voice_path(&voice_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Voice '{voice_name}' not found. Run `guth voices` to see available voices."
+            )
+        })?;
+        let conditioning = load_conditioning_tensor::<B>(&voice_path, device)?;
+        runtime.condition_on_precomputed(conditioning, &mut state)?;
+    } else if let Some(voice_path) = args.voice_file {
+        if !runtime.voice_cloning_supported() {
+            anyhow::bail!(VOICE_CLONING_UNSUPPORTED);
+        }
+        if is_safetensors_path(&voice_path) {
+            let conditioning = load_conditioning_tensor::<B>(&voice_path, device)?;
+            runtime.condition_on_precomputed(conditioning, &mut state)?;
+        } else {
+            runtime.condition_on_audio_path(&voice_path, &mut state)?;
+        }
+    }
+
+    let output_path = args.output.ok_or_else(|| anyhow::anyhow!("--output is required"))?;
+    let sample_rate = runtime.config().mimi.sample_rate as u32;
+    let channels = runtime.config().mimi.channels as usize;
+    if args.stream {
+        let receiver = runtime.generate_audio_stream_with_state(
+            tokens,
+            state,
+            max_gen_len,
+            frames_after_eos,
+        );
+        let mut writer = StreamingWavWriter::create(output_path, sample_rate, channels)?;
+        for (chunk_idx, chunk) in receiver.into_iter().enumerate() {
+            if interrupted.load(Ordering::SeqCst) {
+                writer.finalize()?;
+                anyhow::bail!("Interrupted");
+            }
+            let audio_vec = audio_to_vec(chunk);
+            writer.write_chunk(&audio_vec)?;
+            if args.progress {
+                eprintln!("wrote chunk {chunk_idx}");
+            }
+        }
+        writer.finalize()?;
+    } else {
+        let (_latents, _eos, audio) =
+            runtime.generate_audio_from_tokens(tokens, &mut state, max_gen_len, frames_after_eos)?;
+        if interrupted.load(Ordering::SeqCst) {
+            anyhow::bail!("Interrupted");
+        }
+        let audio_vec = audio_to_vec(audio);
+        WavIo::write_wav(output_path, &audio_vec, sample_rate)?;
+    }
+
+    Ok(())
+}
+
+fn run_voice_encode<B: Backend>(args: VoiceEncodeArgs, device: &B::Device) -> Result<()> {
+    let params = RuntimeParams::new(0.0, 2, None, 0.0);
+    let runtime = TtsRuntime::<B>::from_config_path(
+        resolve_config_path(args.config),
+        params,
+        device,
+    )?;
+    if !runtime.voice_cloning_supported() {
+        anyhow::bail!(VOICE_CLONING_UNSUPPORTED);
+    }
+    let conditioning = runtime.conditioning_from_audio_path(args.input)?;
+    save_tensor(&args.output, "audio_prompt", conditioning)
+}
+
 /// Convert a `[1, channels, samples]` tensor into per-channel vectors.
-fn audio_to_vec(audio: Tensor<NdArray<f32>, 3>) -> Vec<Vec<f32>> {
+fn audio_to_vec<B: Backend>(audio: Tensor<B, 3>) -> Vec<Vec<f32>> {
     let data = audio.to_data();
     let values = data.as_slice::<f32>().expect("audio data");
     let shape = data.shape.clone();
@@ -321,7 +438,7 @@ fn audio_to_vec(audio: Tensor<NdArray<f32>, 3>) -> Vec<Vec<f32>> {
 }
 
 /// Save a 3D tensor to a SafeTensors file.
-fn save_tensor(path: &Path, name: &str, tensor: Tensor<NdArray<f32>, 3>) -> Result<()> {
+fn save_tensor<B: Backend>(path: &Path, name: &str, tensor: Tensor<B, 3>) -> Result<()> {
     let data = tensor.to_data();
     let values = data.as_slice::<f32>().expect("tensor data");
     let mut bytes = Vec::with_capacity(values.len() * 4);
@@ -343,10 +460,10 @@ fn is_safetensors_path(path: &Path) -> bool {
 }
 
 /// Load a conditioning tensor from a SafeTensors file.
-fn load_conditioning_tensor(
+fn load_conditioning_tensor<B: Backend>(
     path: &Path,
-    device: &NdArrayDevice,
-) -> Result<Tensor<NdArray<f32>, 3>> {
+    device: &B::Device,
+) -> Result<Tensor<B, 3>> {
     let data = std::fs::read(path)?;
     let safetensors = safetensors::SafeTensors::deserialize(&data)?;
     let tensor_view = match safetensors.tensor("audio_prompt") {
