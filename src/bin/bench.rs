@@ -138,11 +138,9 @@ fn run_bench<B: Backend>(
 
 /// Entry point for the benchmark binary.
 fn main() -> Result<()> {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn"),
-    )
-    .format_timestamp_millis()
-    .try_init();
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .format_timestamp_millis()
+        .try_init();
 
     let (config_path, args) = parse_args();
 

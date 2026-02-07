@@ -255,10 +255,10 @@ impl PerfSnapshot {
         let mut duration_rows: Vec<(usize, u64, u64)> = Vec::new();
         let mut counter_rows: Vec<(usize, u64)> = Vec::new();
 
-        for idx in 0..Metric::COUNT {
+        for (idx, metric) in METRICS.iter().enumerate() {
             let total_us = self.totals_us[idx];
             let count = self.counts[idx];
-            match METRICS[idx].kind {
+            match metric.kind {
                 MetricKind::Duration => {
                     if count > 0 || total_us > 0 {
                         duration_rows.push((idx, total_us, count));

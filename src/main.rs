@@ -9,8 +9,8 @@ use anyhow::Result;
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use burn_ndarray::{NdArray, NdArrayDevice};
-use clap::{Parser, Subcommand};
 use clap::ValueEnum;
+use clap::{Parser, Subcommand};
 use guth::audio::io::StreamingWavWriter;
 use guth::audio::io::WavIo;
 use guth::audio::resample::AudioResampler;
@@ -251,7 +251,9 @@ fn main() -> Result<()> {
                     #[cfg(not(feature = "backend-wgpu"))]
                     {
                         let _ = args;
-                        anyhow::bail!("WGPU backend not enabled; build with --features backend-wgpu");
+                        anyhow::bail!(
+                            "WGPU backend not enabled; build with --features backend-wgpu"
+                        );
                     }
                 }
                 BackendChoice::Ndarray => {
@@ -382,16 +384,14 @@ fn run_say<B: Backend + Send + Sync + 'static>(
         }
     }
 
-    let output_path = args.output.ok_or_else(|| anyhow::anyhow!("--output is required"))?;
+    let output_path = args
+        .output
+        .ok_or_else(|| anyhow::anyhow!("--output is required"))?;
     let sample_rate = runtime.config().mimi.sample_rate as u32;
     let channels = runtime.config().mimi.channels as usize;
     if args.stream {
-        let receiver = runtime.generate_audio_stream_with_state(
-            tokens,
-            state,
-            max_gen_len,
-            frames_after_eos,
-        );
+        let receiver =
+            runtime.generate_audio_stream_with_state(tokens, state, max_gen_len, frames_after_eos);
         let mut writer = StreamingWavWriter::create(output_path, sample_rate, channels)?;
         for (chunk_idx, chunk) in receiver.into_iter().enumerate() {
             if interrupted.load(Ordering::SeqCst) {
@@ -406,8 +406,12 @@ fn run_say<B: Backend + Send + Sync + 'static>(
         }
         writer.finalize()?;
     } else {
-        let (_latents, _eos, audio) =
-            runtime.generate_audio_from_tokens(tokens, &mut state, max_gen_len, frames_after_eos)?;
+        let (_latents, _eos, audio) = runtime.generate_audio_from_tokens(
+            tokens,
+            &mut state,
+            max_gen_len,
+            frames_after_eos,
+        )?;
         if interrupted.load(Ordering::SeqCst) {
             anyhow::bail!("Interrupted");
         }
@@ -420,11 +424,8 @@ fn run_say<B: Backend + Send + Sync + 'static>(
 
 fn run_voice_encode<B: Backend>(args: VoiceEncodeArgs, device: &B::Device) -> Result<()> {
     let params = RuntimeParams::new(0.0, 2, None, 0.0);
-    let runtime = TtsRuntime::<B>::from_config_path(
-        resolve_config_path(args.config),
-        params,
-        device,
-    )?;
+    let runtime =
+        TtsRuntime::<B>::from_config_path(resolve_config_path(args.config), params, device)?;
     if !runtime.voice_cloning_supported() {
         anyhow::bail!(VOICE_CLONING_UNSUPPORTED);
     }

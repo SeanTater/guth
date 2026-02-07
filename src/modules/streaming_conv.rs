@@ -339,7 +339,7 @@ mod tests {
             groups: 1,
         };
         let op = StreamingConv1dOp::new(config, weight, bias);
-        let mut state = StreamingConv1d::default().init_state(1, 0);
+        let mut state = StreamingConv1d.init_state(1, 0);
 
         let input = Tensor::<TestBackend, 3>::from_floats([[[1.0, 2.0, 3.0]]], &device);
         let first = op.forward(&mut state, input).to_data();
@@ -364,7 +364,7 @@ mod tests {
             groups: 1,
         };
         let op = StreamingConv1dOp::new(config, weight, bias);
-        let mut state = StreamingConv1d::default().init_state(1, 0);
+        let mut state = StreamingConv1d.init_state(1, 0);
 
         let input = Tensor::<TestBackend, 3>::from_floats([[[2.0, 3.0]]], &device);
         let output = op.forward(&mut state, input).to_data();
@@ -385,7 +385,7 @@ mod tests {
             groups: 1,
         };
         let op = StreamingConvTranspose1dOp::new(config, weight, bias);
-        let mut state = StreamingConv1d::default().init_state(1, 0);
+        let mut state = StreamingConv1d.init_state(1, 0);
 
         let input = Tensor::<TestBackend, 3>::from_floats([[[1.0, 1.0]]], &device);
         let output = op.forward(&mut state, input).unwrap().to_data();

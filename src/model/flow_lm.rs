@@ -16,8 +16,8 @@ use crate::{
             StreamingTransformerState,
         },
     },
-    weights::TensorData as WeightTensor,
     perf::{self, Metric},
+    weights::TensorData as WeightTensor,
 };
 use burn::{
     module::Param,

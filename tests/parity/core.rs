@@ -173,7 +173,7 @@ fn parity_attention() {
             ..Default::default()
         };
         let op = StreamingMhaOp::<TestBackend>::new(config, &device);
-        let mut state = StreamingMha::default().init_state(1, 0);
+        let mut state = StreamingMha.init_state(1, 0);
 
         let keys = tensor4(fixture.keys, &device);
         let values = tensor4(fixture.values, &device);

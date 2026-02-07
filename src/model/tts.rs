@@ -10,11 +10,11 @@ use crate::{
         flow_lm::{FlowLmModel, FlowLmState},
         mimi::{MimiModel, MimiState},
     },
+    perf::{self, Metric},
     weights::{
         load_flow_lm_state_dict, load_mimi_state_dict, load_tts_state_dict,
         TensorData as WeightTensor,
     },
-    perf::{self, Metric},
 };
 use burn::tensor::{
     backend::Backend, module::linear, Bool, ElementConversion, Int, Tensor,
@@ -401,18 +401,14 @@ impl<B: Backend + 'static> TtsModel<B> {
                 // Generation loop - no audio conditioning, so dimension mismatch cannot occur.
                 let input = backbone_input;
                 let start = Instant::now();
-                let (latent, is_eos) = match self.run_flow_lm_and_increment(
-                    &mut state,
-                    None,
-                    Some(input),
-                    None,
-                ) {
-                    Ok(result) => result,
-                    Err(e) => {
-                        eprintln!("Error in generate_audio_stream: {e}");
-                        break;
-                    }
-                };
+                let (latent, is_eos) =
+                    match self.run_flow_lm_and_increment(&mut state, None, Some(input), None) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            eprintln!("Error in generate_audio_stream: {e}");
+                            break;
+                        }
+                    };
                 flow_time += start.elapsed();
                 if eos_step.is_none() {
                     let eos_any = is_eos.clone().any().into_scalar();

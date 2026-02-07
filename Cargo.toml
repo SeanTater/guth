@@ -29,6 +29,14 @@ path = "src/lib.rs"
 name = "guth"
 path = "src/main.rs"
 
+[[bin]]
+name = "export_encoding_stages"
+path = "src/bin/export_encoding_stages.rs"
+
+[[bin]]
+name = "compare_backends"
+path = "src/bin/compare_backends.rs"
+
 [dependencies]
 burn = { version = "0.20.1", features = ["ndarray"] }
 burn-nn = "0.20.1"

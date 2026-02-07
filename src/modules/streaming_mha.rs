@@ -306,7 +306,7 @@ mod tests {
             ..Default::default()
         };
         let op = StreamingMhaOp::<TestBackend>::new(config, &device);
-        let mut state = StreamingMha::default().init_state(1, 0);
+        let mut state = StreamingMha.init_state(1, 0);
 
         let keys = Tensor::<TestBackend, 4>::from_floats([[[[1.0, 0.0], [0.0, 1.0]]]], &device);
         let values = Tensor::<TestBackend, 4>::from_floats([[[[1.0, 0.0], [0.0, 1.0]]]], &device);
@@ -324,7 +324,7 @@ mod tests {
             ..Default::default()
         };
         let op = StreamingMhaOp::<TestBackend>::new(config, &device);
-        let mut state = StreamingMha::default().init_state(1, 0);
+        let mut state = StreamingMha.init_state(1, 0);
 
         let keys = Tensor::<TestBackend, 4>::from_floats([[[[1.0, 0.0], [0.0, 1.0]]]], &device);
         let values = Tensor::<TestBackend, 4>::from_floats([[[[1.0, 0.0], [0.0, 1.0]]]], &device);

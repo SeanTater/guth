@@ -233,13 +233,15 @@ impl<B: Backend> MimiModel<B> {
         assert_eq!(channels, self.channels);
 
         let frame_size = self.frame_size();
-        let remainder = length % frame_size;
-        let input = if remainder == 0 {
+
+        // Match Python's pad_for_conv1d(x, frame_size, frame_size) exactly.
+        // This ensures the last convolution window is complete.
+        let extra_padding = get_extra_padding_for_conv1d(length, frame_size, frame_size, 0);
+        let input = if extra_padding == 0 {
             input
         } else {
-            let pad = frame_size - remainder;
             let device = input.device();
-            let padding = Tensor::zeros([batch, channels, pad], &device);
+            let padding = Tensor::zeros([batch, channels, extra_padding], &device);
             Tensor::cat(vec![input, padding], 2)
         };
 
@@ -361,6 +363,36 @@ impl<B: Backend> MimiModel<B> {
 
         Ok(())
     }
+}
+
+/// Compute extra padding for conv1d to ensure the last window is complete.
+///
+/// Matches Python's `get_extra_padding_for_conv1d` exactly:
+/// ```python
+/// n_frames = (length - kernel_size + padding_total) / stride + 1
+/// ideal_length = (ceil(n_frames) - 1) * stride + (kernel_size - padding_total)
+/// extra_padding = ideal_length - length
+/// ```
+fn get_extra_padding_for_conv1d(
+    length: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding_total: usize,
+) -> usize {
+    // Calculate number of frames (can be fractional)
+    let n_frames =
+        (length as f64 - kernel_size as f64 + padding_total as f64) / stride as f64 + 1.0;
+
+    // Compute ideal length that produces ceil(n_frames) complete frames
+    let ceil_frames = n_frames.ceil() as usize;
+    let ideal_length = if ceil_frames == 0 {
+        0
+    } else {
+        (ceil_frames - 1) * stride + kernel_size - padding_total
+    };
+
+    // Return extra padding needed (saturating to handle edge cases)
+    ideal_length.saturating_sub(length)
 }
 
 /// Map padding mode strings to streaming convolution modes.
@@ -587,32 +619,6 @@ fn tensor_f32(tensor: &WeightTensor) -> anyhow::Result<Vec<f32>> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::tensor_f32;
-    use safetensors::Dtype;
-
-    #[test]
-    fn tensor_f32_decodes_bf16() {
-        let values = [0.25_f32, -1.5_f32, 3.0_f32];
-        let mut data = Vec::new();
-        let mut expected = Vec::new();
-        for value in values {
-            let bits = value.to_bits();
-            let bf16 = (bits >> 16) as u16;
-            data.extend_from_slice(&bf16.to_le_bytes());
-            expected.push(f32::from_bits((bf16 as u32) << 16));
-        }
-        let tensor = crate::weights::TensorData {
-            dtype: Dtype::BF16,
-            shape: vec![expected.len()],
-            data,
-        };
-        let decoded = tensor_f32(&tensor).expect("decode bf16");
-        assert_eq!(decoded, expected);
-    }
-}
-
 /// Convert a 1D tensor payload into a Burn tensor.
 fn tensor1_from_data<B: Backend>(
     tensor: &WeightTensor,
@@ -833,4 +839,90 @@ fn apply_upsample_weight<B: Backend>(
         upsample.conv.weight = tensor3_from_data(tensor, device)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{get_extra_padding_for_conv1d, tensor_f32};
+    use safetensors::Dtype;
+
+    #[test]
+    fn tensor_f32_decodes_bf16() {
+        let values = [0.25_f32, -1.5_f32, 3.0_f32];
+        let mut data = Vec::new();
+        let mut expected = Vec::new();
+        for value in values {
+            let bits = value.to_bits();
+            let bf16 = (bits >> 16) as u16;
+            data.extend_from_slice(&bf16.to_le_bytes());
+            expected.push(f32::from_bits((bf16 as u32) << 16));
+        }
+        let tensor = crate::weights::TensorData {
+            dtype: Dtype::BF16,
+            shape: vec![expected.len()],
+            data,
+        };
+        let decoded = tensor_f32(&tensor).expect("decode bf16");
+        assert_eq!(decoded, expected);
+    }
+
+    /// Test padding calculation matches Python's get_extra_padding_for_conv1d.
+    ///
+    /// Python reference:
+    /// ```python
+    /// n_frames = (length - kernel_size + padding_total) / stride + 1
+    /// ideal_length = (ceil(n_frames) - 1) * stride + (kernel_size - padding_total)
+    /// extra_padding = ideal_length - length
+    /// ```
+    #[test]
+    fn extra_padding_matches_python() {
+        // Test with frame_size=1920 (typical Mimi frame size: 24000/12.5)
+        let frame_size = 1920;
+
+        // Exact multiple - no padding needed
+        assert_eq!(
+            get_extra_padding_for_conv1d(1920, frame_size, frame_size, 0),
+            0
+        );
+        assert_eq!(
+            get_extra_padding_for_conv1d(3840, frame_size, frame_size, 0),
+            0
+        );
+
+        // Partial frame - pad to next complete frame
+        // length=24100: n_frames = (24100-1920)/1920 + 1 = 12.552
+        // ideal = (13-1)*1920 + 1920 = 24960, extra = 860
+        assert_eq!(
+            get_extra_padding_for_conv1d(24100, frame_size, frame_size, 0),
+            860
+        );
+
+        // Very short input (less than one frame)
+        // length=1000: n_frames = (1000-1920)/1920 + 1 = 0.521
+        // ideal = (1-1)*1920 + 1920 = 1920, extra = 920
+        assert_eq!(
+            get_extra_padding_for_conv1d(1000, frame_size, frame_size, 0),
+            920
+        );
+
+        // Just over one frame
+        // length=1921: n_frames = (1921-1920)/1920 + 1 = 1.0005
+        // ideal = (2-1)*1920 + 1920 = 3840, extra = 1919
+        assert_eq!(
+            get_extra_padding_for_conv1d(1921, frame_size, frame_size, 0),
+            1919
+        );
+
+        // Test with frame_size=320 (encoder hop length for 8*5*4*2 ratios)
+        let hop = 320;
+        assert_eq!(get_extra_padding_for_conv1d(320, hop, hop, 0), 0);
+        assert_eq!(get_extra_padding_for_conv1d(321, hop, hop, 0), 319);
+        assert_eq!(get_extra_padding_for_conv1d(640, hop, hop, 0), 0);
+
+        // Edge case: zero length
+        assert_eq!(
+            get_extra_padding_for_conv1d(0, frame_size, frame_size, 0),
+            0
+        );
+    }
 }

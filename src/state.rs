@@ -27,7 +27,7 @@ mod tests {
     #[test]
     fn state_tree_gets_and_sets() {
         let mut tree = StateTree::default();
-        assert!(tree.get("missing").is_none());
+        assert!(!tree.contains_key("missing"));
 
         tree.insert("flow".to_string(), 5);
         assert_eq!(tree.get("flow").copied(), Some(5));
