@@ -1,23 +1,10 @@
 repos:
-- repo: https://github.com/astral-sh/ruff-pre-commit
-  rev: v0.12.7
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v6.0.0
   hooks:
-    - id: ruff-check
-      args: [ --fix ]
-    - id: ruff-check
-      args: [ --select=I, --fix ]
-    - id: ruff-format
-    # Use ruff format on markdown files
-    - id: ruff-format
-      types_or: [markdown]
-      require_serial: true
-      entry: doccmd --language python --no-pad-file --command "ruff format"
-      additional_dependencies: ["doccmd"]
-- repo: https://github.com/astral-sh/uv-pre-commit
-  rev: 0.8.22
-  hooks:
-    - id: uv-lock
-      args: ["--directory", "python"]
+    - id: check-yaml
+    - id: end-of-file-fixer
+    - id: trailing-whitespace
 - repo: local
   hooks:
     - id: cargo-fmt

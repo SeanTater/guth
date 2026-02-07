@@ -23,7 +23,7 @@ env:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         target:
@@ -37,8 +37,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
       - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
 
       - name: Build
         run: cross build --release --target ${{ matrix.target }}
@@ -87,6 +92,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -119,6 +127,9 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
       - name: Build
         run: cargo build --release --target x86_64-pc-windows-msvc
 
@@ -144,7 +155,7 @@ jobs:
   # Integration tests - verify archives extract and binaries run
   test-linux-x86_64:
     needs: build-linux
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Download artifact
         uses: actions/download-artifact@v4
@@ -164,7 +175,7 @@ jobs:
 
   test-linux-aarch64:
     needs: build-linux
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Download artifact
         uses: actions/download-artifact@v4
@@ -257,7 +268,7 @@ jobs:
 
   release:
     needs: [test-linux-x86_64, test-linux-aarch64, test-macos-x86_64, test-macos-aarch64, test-windows]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: startsWith(github.ref, 'refs/tags/') && !inputs.dry_run
     permissions:
       contents: write

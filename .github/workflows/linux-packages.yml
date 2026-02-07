@@ -22,7 +22,7 @@ env:
 
 jobs:
   build-deb-x86_64:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -33,7 +33,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-deb
-        run: cargo install cargo-deb
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
 
       - name: Build .deb package
         run: cargo deb
@@ -48,7 +50,7 @@ jobs:
           path: target/debian/*.deb
 
   build-deb-aarch64:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -57,15 +59,20 @@ jobs:
         with:
           targets: aarch64-unknown-linux-gnu
 
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
       - name: Install cross-compilation tools
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Install cross and cargo-deb
-        run: |
-          cargo install cross --git https://github.com/cross-rs/cross
-          cargo install cargo-deb
+        uses: taiki-e/install-action@v2
+        with:
+          tool: |
+            cross
+            cargo-deb
 
       - name: Build with cross
         run: cross build --release --target aarch64-unknown-linux-gnu
@@ -83,7 +90,7 @@ jobs:
           path: target/aarch64-unknown-linux-gnu/debian/*.deb
 
   build-rpm:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -94,7 +101,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-generate-rpm
-        run: cargo install cargo-generate-rpm
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-generate-rpm
 
       - name: Build binary
         run: cargo build --release
@@ -117,7 +126,7 @@ jobs:
   # Integration tests - verify packages install and run correctly
   test-deb-x86_64:
     needs: build-deb-x86_64
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container:
       image: debian:bookworm-slim
     steps:
@@ -144,7 +153,7 @@ jobs:
 
   test-deb-aarch64:
     needs: build-deb-aarch64
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Download deb package
         uses: actions/download-artifact@v4
@@ -166,7 +175,7 @@ jobs:
 
   test-rpm-x86_64:
     needs: build-rpm
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container:
       image: fedora:40
     steps:
@@ -190,7 +199,7 @@ jobs:
 
   upload-to-release:
     needs: [test-deb-x86_64, test-deb-aarch64, test-rpm-x86_64]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: startsWith(github.ref, 'refs/tags/') && !inputs.dry_run
     permissions:
       contents: write
