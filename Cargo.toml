@@ -38,10 +38,12 @@ name = "compare_backends"
 path = "src/bin/compare_backends.rs"
 
 [dependencies]
-burn = { version = "0.20.1", features = ["ndarray"] }
+burn = { version = "0.20.1", features = ["fusion", "ndarray", "tch"] }
 burn-nn = "0.20.1"
 burn-ndarray = "0.20.1"
 burn-cpu = { version = "0.20.1", optional = true }
+burn-tch = { version = "0.20.1", optional = true }
+tch = { version = "0.22", optional = true, default-features = false }
 burn-wgpu = { version = "0.20.1", optional = true, default-features = false, features = ["std", "fusion", "vulkan"] }
 env_logger = "0.11"
 safetensors = "0.4"
@@ -69,6 +71,7 @@ nix = { version = "0.28", default-features = false, features = ["signal"] }
 default = ["backend-wgpu"]
 backend-cpu = ["burn-cpu"]
 backend-ndarray = []
+backend-tch = ["burn-tch", "tch"]
 backend-wgpu = ["burn-wgpu"]
 
 [package.metadata.binstall]

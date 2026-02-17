@@ -1,0 +1,73 @@
+# Build stage for guth with libtorch (tch backend)
+# Note: burn 0.20.1 requires Rust 1.89+
+FROM rust:1.92-bookworm AS builder
+
+# System dependencies for torch-sys build:
+# - cmake/g++/ninja-build: compiles C++ glue code
+# - libssl-dev/pkg-config: for ureq (download-libtorch)
+# - libgomp1: OpenMP runtime linked by libtorch
+RUN apt-get update && apt-get install -y \
+    cmake \
+    g++ \
+    ninja-build \
+    pkg-config \
+    libssl-dev \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Dependency caching layer
+COPY Cargo.toml Cargo.lock ./
+
+# Create dummy source files to build deps first
+RUN mkdir -p src src/bin && \
+    echo "fn main() {}" > src/main.rs && \
+    echo "" > src/lib.rs && \
+    echo "fn main() {}" > src/bin/export_encoding_stages.rs && \
+    echo "fn main() {}" > src/bin/compare_backends.rs
+
+# Build dependencies only (libtorch downloads here, cached unless Cargo.* change).
+# The dummy build may fail to link but still caches all deps including libtorch.
+RUN cargo build --release \
+    --no-default-features --features backend-tch \
+    || true
+RUN rm -rf src
+
+# Copy actual source
+COPY src ./src
+COPY README.md ./
+
+# Build real binary
+RUN touch src/main.rs src/lib.rs && \
+    cargo build --release \
+    --no-default-features --features backend-tch && \
+    strip target/release/guth
+
+# Collect libtorch shared libraries into a flat directory.
+# The download lands in the torch-sys OUT_DIR during build.
+RUN mkdir -p /libtorch-libs && \
+    TORCH_LIB=$(find target/release/build/torch-sys-*/out/libtorch/libtorch/lib -maxdepth 0 | head -1) && \
+    echo "Copying libtorch libs from: $TORCH_LIB" && \
+    cp "$TORCH_LIB"/*.so* /libtorch-libs/ && \
+    echo "--- Bundled libtorch libraries ---" && \
+    ls -lh /libtorch-libs/
+
+# Verify binary works with bundled libs
+RUN LD_LIBRARY_PATH=/libtorch-libs ldd target/release/guth && \
+    LD_LIBRARY_PATH=/libtorch-libs target/release/guth --help
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/guth /usr/local/bin/guth
+COPY --from=builder /libtorch-libs /usr/local/lib/libtorch
+
+ENV LD_LIBRARY_PATH=/usr/local/lib/libtorch
+
+ENTRYPOINT ["/usr/local/bin/guth"]

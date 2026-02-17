@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+#[cfg(feature = "backend-tch")]
+use burn_tch::{LibTorch, LibTorchDevice};
 #[cfg(feature = "backend-wgpu")]
 use burn_wgpu::graphics::AutoGraphicsApi;
 #[cfg(feature = "backend-wgpu")]
@@ -39,6 +41,20 @@ enum BackendChoice {
     Wgpu,
     /// Use the ndarray backend (CPU).
     Ndarray,
+    /// Use the LibTorch backend (PyTorch/CUDA acceleration).
+    Tch,
+}
+
+/// Device selection for backends that support multiple devices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum DeviceChoice {
+    /// Automatically select the best available device (GPU if available).
+    Auto,
+    /// Force CPU execution.
+    Cpu,
+    /// Force CUDA GPU execution.
+    Cuda,
 }
 
 #[cfg(feature = "backend-wgpu")]
@@ -57,6 +73,9 @@ struct Cli {
     /// Compute backend to use.
     #[arg(long, value_enum, default_value_t = DEFAULT_BACKEND, global = true)]
     backend: BackendChoice,
+    /// Device to use (applies to tch and wgpu backends).
+    #[arg(long, value_enum, default_value_t = DeviceChoice::Auto, global = true)]
+    device: DeviceChoice,
     /// Subcommand to execute.
     #[command(subcommand)]
     command: Commands,
@@ -203,6 +222,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let verbose = cli.verbose;
     let backend = cli.backend;
+    let device_choice = cli.device;
 
     match cli.command {
         Commands::Say {
@@ -260,6 +280,20 @@ fn main() -> Result<()> {
                     let device = NdArrayDevice::default();
                     run_say::<NdArray<f32>>(args, &device, interrupted)?;
                 }
+                BackendChoice::Tch => {
+                    #[cfg(feature = "backend-tch")]
+                    {
+                        let device = resolve_tch_device(device_choice)?;
+                        run_say::<LibTorch>(args, &device, interrupted)?;
+                    }
+                    #[cfg(not(feature = "backend-tch"))]
+                    {
+                        let _ = (args, device_choice);
+                        anyhow::bail!(
+                            "Tch backend not enabled; build with --features backend-tch"
+                        );
+                    }
+                }
             }
         }
         Commands::Voices => {
@@ -307,6 +341,20 @@ fn main() -> Result<()> {
                     BackendChoice::Ndarray => {
                         let device = NdArrayDevice::default();
                         run_voice_encode::<NdArray<f32>>(args, &device)?;
+                    }
+                    BackendChoice::Tch => {
+                        #[cfg(feature = "backend-tch")]
+                        {
+                            let device = resolve_tch_device(device_choice)?;
+                            run_voice_encode::<LibTorch>(args, &device)?;
+                        }
+                        #[cfg(not(feature = "backend-tch"))]
+                        {
+                            let _ = (args, device_choice);
+                            anyhow::bail!(
+                                "Tch backend not enabled; build with --features backend-tch"
+                            );
+                        }
                     }
                 }
             }
@@ -475,6 +523,24 @@ fn save_tensor<B: Backend>(path: &Path, name: &str, tensor: Tensor<B, 3>) -> Res
     let serialized = safetensors::serialize(&tensors, &None)?;
     std::fs::write(path, serialized)?;
     Ok(())
+}
+
+/// Resolve a [`DeviceChoice`] to a [`LibTorchDevice`].
+#[cfg(feature = "backend-tch")]
+fn resolve_tch_device(choice: DeviceChoice) -> Result<LibTorchDevice> {
+    match choice {
+        DeviceChoice::Cpu => Ok(LibTorchDevice::Cpu),
+        DeviceChoice::Cuda => Ok(LibTorchDevice::Cuda(0)),
+        DeviceChoice::Auto => {
+            if tch::Cuda::is_available() {
+                eprintln!("CUDA detected, using GPU");
+                Ok(LibTorchDevice::Cuda(0))
+            } else {
+                eprintln!("No CUDA detected, falling back to CPU");
+                Ok(LibTorchDevice::Cpu)
+            }
+        }
+    }
 }
 
 fn is_safetensors_path(path: &Path) -> bool {
